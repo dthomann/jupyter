@@ -6,10 +6,13 @@ class EpisodicMemory:
     Replay buffer (hippocampal-like).
     """
 
-    def __init__(self, capacity=100000):
+    def __init__(self, capacity=100000, rng=None):
+        if rng is None:
+            rng = np.random.RandomState()
         self.capacity = capacity
         self.buffer = []
         self.position = 0
+        self.rng = rng
 
     def store(self, obs, state, action, reward, next_obs, next_state, done):
         transition = (
@@ -31,7 +34,22 @@ class EpisodicMemory:
         if len(self.buffer) == 0:
             return []
         batch_size = min(batch_size, len(self.buffer))
-        idx = np.random.choice(len(self.buffer), batch_size, replace=False)
+        idx = self.rng.choice(len(self.buffer), batch_size, replace=False)
         return [self.buffer[i] for i in idx]
 
+    def to_state(self):
+        return {
+            "capacity": self.capacity,
+            "buffer": list(self.buffer),
+            "position": self.position,
+            "rng_state": self.rng.get_state(),
+        }
 
+    @staticmethod
+    def from_state(state):
+        rng = np.random.RandomState()
+        rng.set_state(state["rng_state"])
+        mem = EpisodicMemory(capacity=state["capacity"], rng=rng)
+        mem.buffer = list(state["buffer"])
+        mem.position = state["position"]
+        return mem

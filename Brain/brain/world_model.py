@@ -44,6 +44,23 @@ class PredictiveCodingLayer:
         self.W_down += delta_W
         return np.linalg.norm(error)
 
+    def to_state(self):
+        return {
+            "input_dim": self.input_dim,
+            "latent_dim": self.latent_dim,
+            "W_down": self.W_down.copy(),
+        }
+
+    @staticmethod
+    def from_state(state, rng=None):
+        layer = PredictiveCodingLayer(
+            input_dim=state["input_dim"],
+            latent_dim=state["latent_dim"],
+            rng=rng,
+        )
+        layer.W_down = np.array(state["W_down"], copy=True)
+        return layer
+
 
 class HierarchicalWorldModel:
     """
@@ -107,4 +124,17 @@ class HierarchicalWorldModel:
         z_states = self.infer(x)
         return z_states[-1]
 
+    def to_state(self):
+        return [layer.to_state() for layer in self.layers]
+
+    @staticmethod
+    def from_state(state, rng=None):
+        if len(state) == 0:
+            return HierarchicalWorldModel(0, [], rng=rng)
+        first = state[0]
+        latent_dims = [layer_state["latent_dim"] for layer_state in state]
+        model = HierarchicalWorldModel(first["input_dim"], latent_dims, rng=rng)
+        for layer, layer_state in zip(model.layers, state):
+            layer.W_down = np.array(layer_state["W_down"], copy=True)
+        return model
 

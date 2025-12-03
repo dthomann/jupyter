@@ -40,4 +40,25 @@ class MultiModalEncoder:
             h_list.append(h)
         return np.concatenate(h_list, axis=0)
 
+    def to_state(self):
+        return {
+            "modalities": list(self.modalities),
+            "hidden_dim_per_modality": self.hidden_dim_per_modality,
+            "W": {k: v.copy() for k, v in self.W.items()},
+            "b": {k: v.copy() for k, v in self.b.items()},
+            "rng_state": self.rng.get_state(),
+        }
+
+    @staticmethod
+    def from_state(state):
+        modality_dims = {name: state["W"][name].shape[0] for name in state["modalities"]}
+        encoder = MultiModalEncoder(
+            modality_dims=modality_dims,
+            hidden_dim_per_modality=state["hidden_dim_per_modality"],
+        )
+        encoder.W = {k: np.array(v, copy=True) for k, v in state["W"].items()}
+        encoder.b = {k: np.array(v, copy=True) for k, v in state["b"].items()}
+        encoder.rng.set_state(state["rng_state"])
+        encoder.output_dim = state["hidden_dim_per_modality"] * len(state["modalities"])
+        return encoder
 

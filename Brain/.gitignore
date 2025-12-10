@@ -148,3 +148,6 @@ Thumbs.db
 *.pyc
 .pytest_cache/
 
+# Training logs
+logs/*.jsonl
+

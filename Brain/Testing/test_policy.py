@@ -233,6 +233,9 @@ def main():
         agent.intrinsic.curiosity_scale = 0.0
         agent.intrinsic.learning_progress_scale = 0.0
 
+    # Note: Agent automatically becomes deterministic when competence is high
+    # No need to manually set evaluation mode
+
     inspect_policy(agent)
 
     # Test against random

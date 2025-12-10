@@ -114,6 +114,20 @@ def test_against_opponent(agent_path, num_games=1000, opponent_type='random'):
     print(f"Loading agent from {agent_path}...")
     agent = BrainAgent.load(agent_path)
     agent.actor_critic.eval()
+    # Note: Agent automatically becomes deterministic when competence is high
+    # No need to manually set evaluation mode
+    
+    # Initialize mode variable if needed (for evaluation, use zero for deterministic behavior)
+    if agent.mode_dim > 0 and agent.current_z_mode is None:
+        import numpy as np
+        # For evaluation, use zero mode (deterministic) or competence-gated if competence is high
+        if agent.competence > 0.9:
+            # High competence -> deterministic (zero mode)
+            agent.current_z_mode = np.zeros(agent.mode_dim, dtype=np.float32)
+        else:
+            # Low competence -> use competence-gated sigma
+            z_sigma = agent.get_competence_gated_z_sigma(agent.z_mode_sigma_base)
+            agent.current_z_mode = agent.rng.normal(0.0, z_sigma, size=agent.mode_dim).astype(np.float32)
 
     wins = 0
     losses = 0
@@ -127,6 +141,14 @@ def test_against_opponent(agent_path, num_games=1000, opponent_type='random'):
             if current_player == X:
                 # Agent's turn - use policy_net directly
                 inp = torch.tensor(board, dtype=torch.float32)
+                # If agent has mode variable, concatenate it to the input
+                if agent.mode_dim > 0:
+                    if agent.current_z_mode is None:
+                        # Fallback: use zero mode
+                        import numpy as np
+                        agent.current_z_mode = np.zeros(agent.mode_dim, dtype=np.float32)
+                    mode_tensor = torch.tensor(agent.current_z_mode, dtype=torch.float32)
+                    inp = torch.cat([inp, mode_tensor])
                 with torch.no_grad():
                     logits = agent.actor_critic.policy_net(inp)
                     # CRITICAL FIX: Mask should be 0.0 for legal moves, -inf for illegal

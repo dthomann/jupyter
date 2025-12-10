@@ -104,7 +104,8 @@ def play_episode_simple(agent, training=True):
         # Compute rewards for each player (like generic_tictactoe.py: r = outcome * player)
         rewards = [outcome * p for p in players]
         agent.actor_critic.update_reinforce(
-            states, actions, rewards, masks, entropy_coeff=0.001, lr=agent.lr_policy)
+            states, actions, rewards, masks, entropy_coeff=0.001, lr=agent.lr_policy,
+            supervised_loss_coeff=getattr(agent, 'supervised_loss_coeff', 5.0))
 
     return outcome, len(states)
 
@@ -174,7 +175,8 @@ def play_episode(agent, env, training=True, temperature=1.0, self_play=True):
     if training and len(states) > 0:
         rewards = [outcome * p for p in players]
         agent.actor_critic.update_reinforce(
-            states, actions, rewards, masks, entropy_coeff=0.001, lr=agent.lr_policy)
+            states, actions, rewards, masks, entropy_coeff=0.001, lr=agent.lr_policy,
+            supervised_loss_coeff=getattr(agent, 'supervised_loss_coeff', 5.0))
 
     return outcome, steps
 
@@ -188,8 +190,11 @@ def test_against_random(agent, num_games=1000):
         dict with statistics: wins, losses, draws, win_rate, loss_rate, draw_rate
     """
     import torch
+    import numpy as np
 
     agent.actor_critic.eval()
+    # Note: Agent automatically becomes deterministic when competence is high
+    # No need to manually set evaluation mode
 
     wins = 0
     losses = 0
@@ -203,6 +208,10 @@ def test_against_random(agent, num_games=1000):
             if current_player == X:
                 # Agent's turn - use policy_net directly
                 inp = torch.tensor(board, dtype=torch.float32)
+                # If agent has mode variable, concatenate it to the input
+                if agent.mode_dim > 0 and agent.current_z_mode is not None:
+                    mode_tensor = torch.tensor(agent.current_z_mode, dtype=torch.float32)
+                    inp = torch.cat([inp, mode_tensor])
                 with torch.no_grad():
                     logits = agent.actor_critic.policy_net(inp)
                     # CRITICAL FIX: Mask should be 0.0 for legal moves, -inf for illegal
@@ -303,7 +312,7 @@ def train_agent(episodes=5000, lr=0.001, entropy_coeff=0.001, self_play=True,
 
     # Disable intrinsic motivation for tic-tac-toe (it adds noise)
     agent.intrinsic.curiosity_scale = 0.0
-    agent.intrinsic.learning_progress_scale = 0.0
+    agent.intrinsic.competence_scale = 0.0
 
     print("Training BrainAgent on Tic-Tac-Toe...")
     print(f"Episodes: {episodes}")

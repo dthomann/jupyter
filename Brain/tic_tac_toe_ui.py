@@ -21,6 +21,8 @@ class TicTacToeUI:
         if agent_path and os.path.exists(agent_path):
             print(f"Loading agent from {agent_path}...")
             self.agent = BrainAgent.load(agent_path)
+            # Note: Agent automatically becomes deterministic when competence is high
+            # No need to manually set evaluation mode
             print(f"Loaded agent with {self.agent.global_step} training steps")
         else:
             print("Creating new agent...")

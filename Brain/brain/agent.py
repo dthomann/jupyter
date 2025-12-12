@@ -1,4 +1,9 @@
-from brainprotocol import OBSERVATION, REWARD, ACTION, TERMINAL, SHUTDOWN
+from brainprotocol import (
+    OBSERVATION, REWARD, ACTION, TERMINAL, SHUTDOWN,
+    DISCOVERY_STARTUP, DISCOVERY_SHUTDOWN, DISCOVERY_ANNOUNCE,
+    DISCOVERY_LIST_PEERS, DISCOVERY_PEER_LIST,
+    PEER_TYPE_BRAIN, PEER_TYPE_ENVIRONMENT
+)
 import numpy as np
 import pickle
 import time
@@ -299,12 +304,30 @@ class BrainAgent:
         self.competence = (1.0 - self.competence_alpha) * \
             self.competence + self.competence_alpha * stability
 
+    def _ensure_mode_initialized(self):
+        """
+        Ensure current_z_mode is initialized if mode_dim > 0.
+        This prevents dimension mismatches when act() is called before on_observation().
+        """
+        if self.mode_dim > 0 and self.current_z_mode is None:
+            # Initialize with competence-gated mode (same logic as on_observation)
+            # Mode variance is gated by competence
+            # When competent (C_t → 1), z_sigma → 0 (deterministic)
+            # When not competent (C_t → 0), z_sigma → base value
+            z_sigma = self.get_competence_gated_z_sigma(self.z_mode_sigma_base)
+            # Sample z_mode ~ N(0, z_sigma^2 * I)
+            self.current_z_mode = self.rng.normal(
+                0.0, z_sigma, size=self.mode_dim).astype(np.float32)
+
     def act(self, obs, temperature=1.0, greedy=False, legal_mask=None):
         z, x = self.encode_state(obs)
         policy_state = x if self.use_raw_obs_for_policy else z
 
+        # Ensure mode is initialized if needed
+        self._ensure_mode_initialized()
+
         # Concatenate mode variable if enabled
-        if self.mode_dim > 0 and self.current_z_mode is not None:
+        if self.mode_dim > 0:
             policy_state = np.concatenate([policy_state, self.current_z_mode])
 
         # Hippocampal Retrieval (Context)
@@ -363,8 +386,11 @@ class BrainAgent:
         policy_state = x if self.use_raw_obs_for_policy else z
         policy_next_state = x_next if self.use_raw_obs_for_policy else z_next
 
+        # Ensure mode is initialized if needed
+        self._ensure_mode_initialized()
+
         # Concatenate mode variable if enabled
-        if self.mode_dim > 0 and self.current_z_mode is not None:
+        if self.mode_dim > 0:
             policy_state = np.concatenate([policy_state, self.current_z_mode])
             policy_next_state = np.concatenate(
                 [policy_next_state, self.current_z_mode])
@@ -454,8 +480,10 @@ class BrainAgent:
             legal_mask = transition.get('legal_mask')
 
             policy_state = x if self.use_raw_obs_for_policy else z
+            # Ensure mode is initialized if needed
+            self._ensure_mode_initialized()
             # Concatenate mode variable if enabled
-            if self.mode_dim > 0 and self.current_z_mode is not None:
+            if self.mode_dim > 0:
                 policy_state = np.concatenate(
                     [policy_state, self.current_z_mode])
             reward = transition['total_reward']  # Use biological reward
@@ -494,8 +522,26 @@ class BrainAgent:
 
     def on_observation(self, sensors, info):
         episode_num = info.get("episode", 0)
-        if episode_num > self.episode_index:
-            self.episode_index = episode_num
+        # Update episode_index to match environment's episode number
+        # This ensures we track episodes correctly even if brain was loaded with a higher episode_index
+        if episode_num > 0 and episode_num != self.episode_index:
+            # If this is a new episode (higher number), reset episode state
+            if episode_num > self.episode_index:
+                self.episode_index = episode_num
+                self.episode_board = None
+                self.episode_player = None
+                self.episode_states = []
+                self.episode_actions = []
+                self.episode_players = []
+                self.episode_masks = []
+                self.cum_reward = 0.0
+                self._current_episode_random_player = None
+                # Also clear STM on new episode if not done already
+                self.hippocampus.stm.clear()
+            else:
+                # Environment episode number is lower (e.g., environment restarted)
+                # Update to match environment but don't reset state
+                self.episode_index = episode_num
             self.episode_board = None
             self.episode_player = None
             self.episode_states = []
@@ -540,8 +586,21 @@ class BrainAgent:
         self.pending_decision = True
 
     def on_reward(self, value: float, info):
+        """
+        Process reward from environment.
+
+        Important: do NOT set pending_decision here.
+        The brain should only emit a new ACTION when it receives a new OBSERVATION.
+        Rewards update internal state (cum_reward, learning), but do not by themselves
+        require an immediate action.
+
+        This guarantees:
+        - exactly one action per observation, and
+        - no stale actions caused by reward messages arriving between episodes.
+        """
         self.cum_reward += float(value)
-        self.pending_decision = True
+        # Intentionally do NOT set self.pending_decision here.
+        # The next decision will be triggered by the next on_observation().
 
     def tick(self, dt: float) -> Optional[Dict[str, Any]]:
         if not self.pending_decision:
@@ -569,12 +628,30 @@ class BrainAgent:
                 # Environment explicitly tells us whose turn it is
                 if current_turn_from_env != self.my_player_symbol:
                     # Not this brain's turn, don't send action
+                    # Clear pending_decision to avoid repeatedly checking
+                    self.pending_decision = False
+                    # Debug: log why we're not acting (only once per episode)
+                    episode = info.get("episode", 0)
+                    log_key = f'_turn_check_logged_ep{episode}'
+                    if not hasattr(self, log_key):
+                        print(
+                            f"[brain] tick() returning None: current_turn={current_turn_from_env} != my_player={self.my_player_symbol}, episode={episode}")
+                        setattr(self, log_key, True)
                     return None
+                else:
+                    # It's our turn - clear the log flag for this episode
+                    episode = info.get("episode", 0)
+                    log_key = f'_turn_check_logged_ep{episode}'
+                    if hasattr(self, log_key):
+                        delattr(self, log_key)
             else:
+                # No current_turn in info - use fallback logic
                 # Fallback: determine from board state
                 current_turn_player = "X" if self.episode_player == 1 else "O"
                 if current_turn_player != self.my_player_symbol:
                     # Not this brain's turn, don't send action
+                    # Clear pending_decision to avoid repeatedly checking
+                    self.pending_decision = False
                     return None
 
         if self.last_legal_actions is not None:
@@ -638,7 +715,9 @@ class BrainAgent:
         if self.episode_based_learning and record_transition:
             # Store policy state with mode variable included
             policy_state = x if self.use_raw_obs_for_policy else z
-            if self.mode_dim > 0 and self.current_z_mode is not None:
+            # Ensure mode is initialized if needed
+            self._ensure_mode_initialized()
+            if self.mode_dim > 0:
                 policy_state_with_mode = np.concatenate(
                     [policy_state, self.current_z_mode])
             else:
@@ -1148,17 +1227,28 @@ class BrainAgent:
         if connection_config.listen_address:
             print(
                 f"[brain] Listener enabled on {connection_config.listen_address}")
-        for peer_id, peer_host, peer_port in connection_config.peers:
-            print(
-                f"[brain] Will connect to peer '{peer_id}' at {peer_host}:{peer_port}")
 
-        # Create ConnectionManager
-        connection_manager = ConnectionManager(connection_config)
-        default_peer_id = connection_config.default_peer_id
+        # Create ConnectionManager (uses multicast discovery)
+        print(
+            f"[brain] Creating ConnectionManager for {connection_config.brain_id}...")
+        connection_manager = ConnectionManager(
+            connection_config, peer_type=PEER_TYPE_BRAIN)
+        print(f"[brain] ConnectionManager created, starting discovery...")
+
+        # Helper to find environment connection
+        def get_environment_peer_id():
+            """Find the connected environment peer."""
+            for peer_id, metadata in connection_manager.connection_metadata.items():
+                if (peer_id in connection_manager.connections and
+                        metadata.get("peer_type") == PEER_TYPE_ENVIRONMENT):
+                    return peer_id
+            return None
 
         try:
             running = True
             initial_episode = self.episode_index
+            # Track environment's starting episode for correct "trained for X episodes" calculation
+            self._environment_starting_episode = None
 
             # Setup decay parameters (same as before)
             if entropy_start is None:
@@ -1197,39 +1287,98 @@ class BrainAgent:
             self._random_opponent_initial_episode = initial_episode
             self._random_opponent_decay_type = random_opponent_decay_type
 
-            # Wait for initial message from default peer (environment)
+            # Wait for environment connection and initial observation
             import time as time_module
-            print(
-                f"[brain] Waiting for initial observation from {default_peer_id}...")
+            print("[brain] Discovering environment via multicast...")
             initial_received = False
+            env_discovered_logged = False
+            env_connected_logged = False
             while not initial_received:
                 try:
+                    # First, check if we've discovered the environment via multicast
+                    known_peers = connection_manager.get_all_known_peers()
+                    env_peers = [pid for pid, info in known_peers.items()
+                                 if info.kind == PEER_TYPE_ENVIRONMENT]
+
+                    if env_peers and not env_discovered_logged:
+                        env_count = len(env_peers)
+                        if env_count == 1:
+                            print(
+                                f"[brain] Discovered environment: {env_peers[0]}")
+                            env_discovered_logged = True
+                        else:
+                            print(
+                                f"[brain] Discovered {env_count} environments, waiting for single environment...")
+                            env_discovered_logged = True
+
+                    # Only check for connection after discovery
+                    if env_peers:
+                        env_peer_id = get_environment_peer_id()
+                        if env_peer_id and not env_connected_logged:
+                            print(
+                                f"[brain] Connected to environment: {env_peer_id}")
+                            env_connected_logged = True
+                    else:
+                        # No environment discovered yet, wait a bit
+                        time_module.sleep(0.1)
+                        continue
+
                     events = connection_manager.poll_events()
                     for peer_id, msg in events:
-                        # Only process initial observation from default peer (environment)
-                        if peer_id == default_peer_id and isinstance(msg, dict) and msg.get("type") == OBSERVATION:
-                            info = msg.get("info", {})
-                            player = info.get("player", "?")
-                            episode = info.get("episode", 0)
-                            print(
-                                f"[brain] Training started! I am player {player}, Episode {episode}")
-                            self.on_observation(
-                                msg.get("sensors", []), info)
-                            try:
-                                action_msg = self.tick(0.0)
-                                if action_msg is not None:
-                                    connection_manager.send(
-                                        default_peer_id, action_msg)
-                            except Exception as e:
+                        # Process initial observation from environment
+                        if isinstance(msg, dict) and msg.get("type") == OBSERVATION:
+                            peer_type = connection_manager.get_peer_type(
+                                peer_id)
+                            if peer_type == PEER_TYPE_ENVIRONMENT:
+                                info = msg.get("info", {})
+                                player = info.get("player", "?")
+                                episode = info.get("episode", 0)
+                                # Track environment's starting episode
+                                if self._environment_starting_episode is None and episode > 0:
+                                    self._environment_starting_episode = episode - 1
                                 print(
-                                    f"[brain] Error sending initial action: {e}")
-                            initial_received = True
-                            break
+                                    f"[brain] Training started! I am player {player}, Episode {episode}")
+                                self.on_observation(
+                                    msg.get("sensors", []), info)
+                                # Ensure pending_decision is set (on_observation should set it, but double-check)
+                                if not self.pending_decision:
+                                    print(
+                                        f"[brain] WARNING: pending_decision is False after on_observation(), setting to True")
+                                    self.pending_decision = True
+                                try:
+                                    # Verify info is set correctly
+                                    last_info = getattr(
+                                        self, '_last_observation_info', {})
+                                    print(
+                                        f"[brain] Calling tick() for initial observation: my_player={self.my_player_symbol}, current_turn={info.get('current_turn')}, last_info_current_turn={last_info.get('current_turn')}, pending_decision={self.pending_decision}, last_sensors={self.last_sensors is not None}")
+                                    action_msg = self.tick(0.0)
+                                    if action_msg is not None:
+                                        print(
+                                            f"[brain] Sending initial action: {action_msg.get('actions', [])} to {peer_id}")
+                                        connection_manager.send(
+                                            peer_id, action_msg)
+                                    else:
+                                        print(
+                                            f"[brain] tick() returned None for initial observation (my_player={self.my_player_symbol}, current_turn={info.get('current_turn')}, pending_decision={self.pending_decision})")
+                                        # Check why it returned None
+                                        if not self.pending_decision:
+                                            print(
+                                                f"[brain] pending_decision is False")
+                                        if self.last_sensors is None:
+                                            print(
+                                                f"[brain] last_sensors is None")
+                                except Exception as e:
+                                    print(
+                                        f"[brain] Error sending initial action: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                                initial_received = True
+                                break
 
                     if not initial_received:
-                        # Check if default peer is connected
-                        if default_peer_id not in connection_manager.connections:
-                            # Wait a bit and check for reconnection
+                        env_peer_id = get_environment_peer_id()
+                        if not env_peer_id:
+                            # No environment connected yet
                             time_module.sleep(0.1)
                         else:
                             # Connected but no message yet
@@ -1262,18 +1411,64 @@ class BrainAgent:
                         if not isinstance(msg, dict):
                             continue
                         mtype = msg.get("type")
-                        # Process messages from default peer (environment) as before
-                        # Other peers can be handled differently if needed
-                        if mtype == OBSERVATION:
+
+                        # Handle discovery messages (startup/shutdown are now handled via multicast)
+                        if mtype == DISCOVERY_STARTUP:
+                            # Peer sent startup message over TCP - just acknowledge
+                            sender_peer_id = msg.get("peer_id") or peer_id
+                            sender_peer_type = msg.get("peer_type", "unknown")
+                            print(
+                                f"[brain] Received startup from {sender_peer_id} ({sender_peer_type})")
+                            message_processed = True
+
+                        elif mtype == DISCOVERY_SHUTDOWN:
+                            # Peer is shutting down
+                            sender_peer_id = msg.get("peer_id")
+                            sender_peer_type = msg.get("peer_type", "unknown")
+                            print(
+                                f"[brain] Peer {sender_peer_id} ({sender_peer_type}) is shutting down")
+                            if sender_peer_type == PEER_TYPE_ENVIRONMENT:
+                                print(
+                                    "[brain] Environment shutting down - waiting for reconnection...")
+                                connection_manager._mark_disconnected(
+                                    sender_peer_id)
+                                self._was_waiting_for_reconnect = True
+                            message_processed = True
+
+                        # Process application messages from environment
+                        elif mtype == OBSERVATION:
+                            # OBSERVATION messages only come from environments
+                            peer_type = connection_manager.get_peer_type(
+                                peer_id)
+                            if peer_type == PEER_TYPE_ENVIRONMENT:
+                                # Check if we just reconnected
+                                if hasattr(self, '_was_waiting_for_reconnect'):
+                                    print(
+                                        f"[brain] Received observation from reconnected environment, resuming training...")
+                                    delattr(self, '_was_waiting_for_reconnect')
+
+                            # Process observation from environment
                             self.on_observation(
                                 msg.get("sensors", []), msg.get("info", {}))
                             message_processed = True
                         elif mtype == REWARD:
+                            # REWARD messages only come from environments
+                            # Process reward from environment
                             self.on_reward(
                                 float(msg.get("value", 0.0)), msg.get("info", {}))
                             message_processed = True
                         elif mtype == TERMINAL:
-                            self._handle_terminal(msg.get("info", {}))
+                            # TERMINAL messages only come from environments
+                            # Process terminal from environment
+                            # Always process TERMINAL messages (they only come from environments)
+                            info = msg.get("info", {})
+                            episode_num = info.get("episode", 0)
+                            # Update episode_index to match environment's episode number
+                            # This ensures we track episodes correctly for the "trained for X episodes" message
+                            if episode_num > 0:
+                                self.episode_index = episode_num
+
+                            self._handle_terminal(info)
 
                             if self.episode_index % stats_every == 0:
                                 self.print_performance_stats(
@@ -1360,9 +1555,17 @@ class BrainAgent:
                                 self.save(save_path)
                             message_processed = True
                         elif mtype == SHUTDOWN:
-                            print("[brain] received shutdown message")
-                            connection_manager.close()
-                            return
+                            # Environment is shutting down - treat as disconnection and wait for reconnection
+                            # Don't exit the brain, just mark the connection as disconnected
+                            peer_type = connection_manager.get_peer_type(
+                                peer_id)
+                            if peer_type == PEER_TYPE_ENVIRONMENT:
+                                print(
+                                    "[brain] Environment sent shutdown message - waiting for reconnection...")
+                                connection_manager._mark_disconnected(peer_id)
+                                # Mark that we're waiting for reconnect
+                                self._was_waiting_for_reconnect = True
+                            message_processed = True
                     except Exception as e:
                         print(
                             f"[brain] Error processing message from {peer_id}: {e}")
@@ -1371,6 +1574,25 @@ class BrainAgent:
 
                 if not running:
                     break
+
+                # Check if environment is connected
+                env_peer_id = get_environment_peer_id()
+                if not env_peer_id:
+                    # Environment is disconnected, wait for reconnection
+                    self._was_waiting_for_reconnect = True
+                    # Log waiting status periodically (every 5 seconds)
+                    if not hasattr(self, '_last_reconnect_log') or (time.time() - self._last_reconnect_log) > 5.0:
+                        print(
+                            "[brain] Environment disconnected, waiting for reconnection...")
+                    self._last_reconnect_log = time.time()
+                    # Sleep longer when disconnected to reduce CPU usage
+                    time.sleep(0.1)
+                    continue  # Skip processing actions until reconnected
+                else:
+                    # Clear reconnect log time when connected
+                    if hasattr(self, '_last_reconnect_log'):
+                        delattr(self, '_last_reconnect_log')
+
                 if message_processed or elapsed >= self.dt:
                     if elapsed >= self.dt:
                         last_time = now
@@ -1379,17 +1601,49 @@ class BrainAgent:
                         action_msg = self.tick(
                             elapsed if elapsed >= self.dt else 0.0)
                         if action_msg is not None:
-                            # Send to default peer (environment)
-                            connection_manager.send(
-                                default_peer_id, action_msg)
+                            # Send to environment
+                            env_peer_id = get_environment_peer_id()
+                            if env_peer_id:
+                                # print(
+                                #     f"[brain] Sending action to environment: {action_msg.get('actions', [])}")
+                                connection_manager.send(
+                                    env_peer_id, action_msg)
+                        elif self.pending_decision:
+                            # We have a pending decision but tick() returned None
+                            # This might be because it's not our turn
+                            info = getattr(self, '_last_observation_info', {})
+                            current_turn = info.get("current_turn", "unknown")
+                            if current_turn != self.my_player_symbol:
+                                # Not our turn, that's expected
+                                pass
                     except Exception as e:
                         print(f"[brain] Error in tick(): {e}")
+                        import traceback
+                        traceback.print_exc()
                         # Continue - don't break on other errors
                 time.sleep(0.001)
 
         except KeyboardInterrupt:
             print("\n[brain] interrupted by user")
         finally:
+            # Process any remaining messages to ensure episode_index is up to date
+            try:
+                for _ in range(10):  # Poll a few times to catch any pending messages
+                    events = connection_manager.poll_events()
+                    if not events:
+                        break
+                    for peer_id, msg in events:
+                        if isinstance(msg, dict):
+                            mtype = msg.get("type")
+                            if mtype == TERMINAL:
+                                info = msg.get("info", {})
+                                episode_num = info.get("episode", 0)
+                                if episode_num > 0:
+                                    self.episode_index = episode_num
+                                self._handle_terminal(info)
+            except Exception:
+                pass  # Don't fail on cleanup
+
             connection_manager.close()
             last_logged_episode = flush_metrics(last_logged_episode)
 

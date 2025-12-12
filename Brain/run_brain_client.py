@@ -136,7 +136,7 @@ is running in two-brain mode (default) and start two brain clients.
     parser.add_argument('--enable-listener', action='store_true',
                         help='Enable incoming connection listener (requires --listen-host and --listen-port)')
     parser.add_argument('--peer', action='append', nargs=3, metavar=('PEER_ID', 'HOST', 'PORT'),
-                        help='Add outgoing peer connection: --peer PEER_ID HOST PORT (can be specified multiple times)')
+                        help='[DEPRECATED] Peers are now discovered via multicast. This argument is ignored.')
 
     # Persistence
     parser.add_argument('--load', type=str, default=None,
@@ -246,11 +246,13 @@ is running in two-brain mode (default) and start two brain clients.
         print(f"Loading brain from {args.load}...")
         agent = BrainAgent.load(args.load)
         print("Brain loaded successfully")
-    elif args.load:
-        # File doesn't exist, but path was specified - will create new brain
-        print(f"Brain file {args.load} not found, will create new brain")
+        agent.stats_window = stats_window
     else:
-        print("Creating new brain...")
+        # Create new brain (either file doesn't exist or no load path specified)
+        if args.load:
+            print(f"Brain file {args.load} not found, will create new brain")
+        else:
+            print("Creating new brain...")
         # Create agent with episode-based learning enabled
         agent_rng = np.random.RandomState(
             seed_value) if seed_value is not None else None
@@ -316,7 +318,7 @@ is running in two-brain mode (default) and start two brain clients.
         print(f"  Competence scale: {agent.intrinsic.competence_scale:.3f}")
         print(f"  Autonomy scale: {agent.intrinsic.autonomy_scale:.3f}")
 
-    agent.stats_window = stats_window
+        agent.stats_window = stats_window
 
     print(f"\nConnecting to environment at {args.host}:{args.port}...")
     if args.play_against_opponent:
@@ -342,11 +344,10 @@ is running in two-brain mode (default) and start two brain clients.
     initial_episode = agent.episode_index
 
     # Build connection config from args
-    # Parse peer connections if provided
-    peers = None
+    # Note: peers are now discovered via multicast, so --peer argument is ignored
     if args.peer:
-        peers = [(peer_id, host, int(port))
-                 for peer_id, host, port in args.peer]
+        print(
+            "[brain] Warning: --peer argument is ignored (peers are discovered via multicast)")
 
     # Validate listener args
     if args.enable_listener and args.listen_host is None:
@@ -355,14 +356,13 @@ is running in two-brain mode (default) and start two brain clients.
         parser.error("--listen-port requires --listen-host")
 
     connection_config = BrainConnectionConfig.from_args(
-        host=args.host,
-        port=args.port,
+        host=args.host,  # Ignored - kept for backwards compatibility
+        port=args.port,  # Ignored - kept for backwards compatibility
         authkey=args.authkey.encode() if isinstance(
             args.authkey, str) else args.authkey,
         brain_id=args.brain_id,
         listen_host=args.listen_host,
         listen_port=args.listen_port,
-        peers=peers,
         enable_listener=args.enable_listener,
     )
 
@@ -417,9 +417,16 @@ is running in two-brain mode (default) and start two brain clients.
         try:
             print(f"\n[brain] Auto-saving brain to {brain_file}...")
             agent.save(brain_file)
-            episodes_trained = agent.episode_index - initial_episode
+            # Use environment's starting episode if available, otherwise use initial_episode
+            if hasattr(agent, '_environment_starting_episode') and agent._environment_starting_episode is not None:
+                start_episode = agent._environment_starting_episode
+            else:
+                start_episode = initial_episode
+            episodes_trained = agent.episode_index - start_episode
+            # Debug: show what values we're using
             print(
-                f"[brain] Brain saved successfully (trained for {episodes_trained} episodes)")
+                f"[brain] Brain saved successfully (trained for {episodes_trained} episodes) "
+                f"(episode_index={agent.episode_index}, start_episode={start_episode})")
         except Exception as e:
             print(f"[brain] Warning: Failed to save brain: {e}")
             import traceback

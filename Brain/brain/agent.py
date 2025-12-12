@@ -153,6 +153,8 @@ class BrainAgent:
         self.competence_w3 = 0.3  # Weight for loss_rate in stability calculation
         self.competence_sigmoid_a = 10.0  # Sigmoid parameter a
         self.competence_sigmoid_b = -0.5  # Sigmoid parameter b
+        self._pending_episode = None
+        self._pending_turn = None
 
     # ----- input handling -----
 
@@ -583,7 +585,18 @@ class BrainAgent:
         else:
             self.last_legal_actions = None
 
-        self.pending_decision = True
+        # ---- NEW: strict decision context ----
+        episode = info.get("episode")
+        turn = info.get("current_turn")
+
+        # Only allow an action if this observation defines a valid decision context
+        if episode is not None and turn is not None:
+            self._pending_episode = episode
+            self._pending_turn = turn
+            self.pending_decision = True
+        else:
+            # Observation without decision semantics -> no action allowed
+            self.pending_decision = False
 
     def on_reward(self, value: float, info):
         """
@@ -604,6 +617,15 @@ class BrainAgent:
 
     def tick(self, dt: float) -> Optional[Dict[str, Any]]:
         if not self.pending_decision:
+            return None
+
+        info = getattr(self, "_last_observation_info", {})
+        episode = info.get("episode")
+        turn = info.get("current_turn")
+
+        # Drop decision if context changed
+        if episode != self._pending_episode or turn != self._pending_turn:
+            self.pending_decision = False
             return None
 
         if self.last_sensors is None or len(self.last_sensors) == 0:
@@ -738,7 +760,12 @@ class BrainAgent:
         return {
             "type": ACTION,
             "actions": [int(action)],
-            "info": {"t": time.time(), "cum_reward": self.cum_reward},
+            "info": {
+                "t": time.time(),
+                "episode": self._pending_episode,
+                "turn": self._pending_turn,
+                "cum_reward": self.cum_reward,
+            },
         }
 
     def _check_winner(self, board):
@@ -1345,33 +1372,6 @@ class BrainAgent:
                                     print(
                                         f"[brain] WARNING: pending_decision is False after on_observation(), setting to True")
                                     self.pending_decision = True
-                                try:
-                                    # Verify info is set correctly
-                                    last_info = getattr(
-                                        self, '_last_observation_info', {})
-                                    print(
-                                        f"[brain] Calling tick() for initial observation: my_player={self.my_player_symbol}, current_turn={info.get('current_turn')}, last_info_current_turn={last_info.get('current_turn')}, pending_decision={self.pending_decision}, last_sensors={self.last_sensors is not None}")
-                                    action_msg = self.tick(0.0)
-                                    if action_msg is not None:
-                                        print(
-                                            f"[brain] Sending initial action: {action_msg.get('actions', [])} to {peer_id}")
-                                        connection_manager.send(
-                                            peer_id, action_msg)
-                                    else:
-                                        print(
-                                            f"[brain] tick() returned None for initial observation (my_player={self.my_player_symbol}, current_turn={info.get('current_turn')}, pending_decision={self.pending_decision})")
-                                        # Check why it returned None
-                                        if not self.pending_decision:
-                                            print(
-                                                f"[brain] pending_decision is False")
-                                        if self.last_sensors is None:
-                                            print(
-                                                f"[brain] last_sensors is None")
-                                except Exception as e:
-                                    print(
-                                        f"[brain] Error sending initial action: {e}")
-                                    import traceback
-                                    traceback.print_exc()
                                 initial_received = True
                                 break
 
@@ -1601,6 +1601,7 @@ class BrainAgent:
                         action_msg = self.tick(
                             elapsed if elapsed >= self.dt else 0.0)
                         if action_msg is not None:
+                            # print(f"[brain] Sending action to environment: {action_msg}")
                             # Send to environment
                             env_peer_id = get_environment_peer_id()
                             if env_peer_id:

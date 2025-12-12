@@ -394,40 +394,40 @@ class ConnectionManager:
                                 "peer_id") or msg.get("from_id")
                             sender_peer_type = msg.get("peer_type", "unknown")
 
-                            # TEMPORARY: Log all received messages except discovery/broadcast messages
-                            msg_type = msg.get("type", "unknown")
-                            if not msg_type.startswith("discovery/"):
-                                # Log the message with sender and receiver info
-                                sender_info = f"{sender_peer_type} {sender_peer_id or peer_id}"
-                                receiver_info = f"{self.peer_type} {self.node_id}"
-                                print(
-                                    f"[MSG_RECV] {sender_info} -> {receiver_info}: type={msg_type}")
-
-                                # Log message content (truncate large arrays)
-                                if msg_type == "observation":
-                                    sensors = msg.get("sensors", [])
-                                    if isinstance(sensors, list) and len(sensors) > 10:
-                                        print(
-                                            f"  sensors=[{sensors[:5]}... ({len(sensors)} total)]")
-                                    else:
-                                        print(f"  sensors={sensors}")
-                                    print(f"  info={msg.get('info', {})}")
-                                elif msg_type == "action":
-                                    actions = msg.get("actions", [])
-                                    print(f"  actions={actions}")
-                                    print(f"  info={msg.get('info', {})}")
-                                elif msg_type == "reward":
-                                    print(f"  value={msg.get('value')}")
-                                    print(f"  info={msg.get('info', {})}")
-                                elif msg_type == "terminal":
-                                    print(f"  info={msg.get('info', {})}")
-                                else:
-                                    # For other message types, log the full message (but limit size)
-                                    msg_str = str(msg)
-                                    if len(msg_str) > 200:
-                                        print(f"  {msg_str[:200]}...")
-                                    else:
-                                        print(f"  {msg_str}")
+                            # Message logging disabled
+                            # msg_type = msg.get("type", "unknown")
+                            # if not msg_type.startswith("discovery/"):
+                            #     # Log the message with sender and receiver info
+                            #     sender_info = f"{sender_peer_type} {sender_peer_id or peer_id}"
+                            #     receiver_info = f"{self.peer_type} {self.node_id}"
+                            #     print(
+                            #         f"[MSG_RECV] {sender_info} -> {receiver_info}: type={msg_type}")
+                            #
+                            #     # Log message content (truncate large arrays)
+                            #     if msg_type == "observation":
+                            #         sensors = msg.get("sensors", [])
+                            #         if isinstance(sensors, list) and len(sensors) > 10:
+                            #             print(
+                            #                 f"  sensors=[{sensors[:5]}... ({len(sensors)} total)]")
+                            #         else:
+                            #             print(f"  sensors={sensors}")
+                            #         print(f"  info={msg.get('info', {})}")
+                            #     elif msg_type == "action":
+                            #         actions = msg.get("actions", [])
+                            #         print(f"  actions={actions}")
+                            #         print(f"  info={msg.get('info', {})}")
+                            #     elif msg_type == "reward":
+                            #         print(f"  value={msg.get('value')}")
+                            #         print(f"  info={msg.get('info', {})}")
+                            #     elif msg_type == "terminal":
+                            #         print(f"  info={msg.get('info', {})}")
+                            #     else:
+                            #         # For other message types, log the full message (but limit size)
+                            #         msg_str = str(msg)
+                            #         if len(msg_str) > 200:
+                            #             print(f"  {msg_str[:200]}...")
+                            #         else:
+                            #             print(f"  {msg_str}")
 
                             # Update peer_id if this was a temporary incoming connection
                             if peer_id.startswith("incoming_") and sender_peer_id and sender_peer_id != peer_id:
@@ -521,40 +521,40 @@ class ConnectionManager:
             msg["peer_id"] = self.node_id
             msg["peer_type"] = self.peer_type
 
-            # TEMPORARY: Log all messages except discovery/broadcast messages
-            msg_type = msg.get("type", "unknown")
-            if not msg_type.startswith("discovery/"):
-                # Log the message with sender and receiver info
-                sender_info = f"{self.peer_type} {self.node_id}"
-                receiver_info = f"{peer_id}"
-                print(
-                    f"[MSG_SEND] {sender_info} -> {receiver_info}: type={msg_type}")
-
-                # Log message content (truncate large arrays)
-                if msg_type == "observation":
-                    sensors = msg.get("sensors", [])
-                    if isinstance(sensors, list) and len(sensors) > 10:
-                        print(
-                            f"  sensors=[{sensors[:5]}... ({len(sensors)} total)]")
-                    else:
-                        print(f"  sensors={sensors}")
-                    print(f"  info={msg.get('info', {})}")
-                elif msg_type == "action":
-                    actions = msg.get("actions", [])
-                    print(f"  actions={actions}")
-                    print(f"  info={msg.get('info', {})}")
-                elif msg_type == "reward":
-                    print(f"  value={msg.get('value')}")
-                    print(f"  info={msg.get('info', {})}")
-                elif msg_type == "terminal":
-                    print(f"  info={msg.get('info', {})}")
-                else:
-                    # For other message types, log the full message (but limit size)
-                    msg_str = str(msg)
-                    if len(msg_str) > 200:
-                        print(f"  {msg_str[:200]}...")
-                    else:
-                        print(f"  {msg_str}")
+            # Message logging disabled
+            # msg_type = msg.get("type", "unknown")
+            # if not msg_type.startswith("discovery/"):
+            #     # Log the message with sender and receiver info
+            #     sender_info = f"{self.peer_type} {self.node_id}"
+            #     receiver_info = f"{peer_id}"
+            #     print(
+            #         f"[MSG_SEND] {sender_info} -> {receiver_info}: type={msg_type}")
+            #
+            #     # Log message content (truncate large arrays)
+            #     if msg_type == "observation":
+            #         sensors = msg.get("sensors", [])
+            #         if isinstance(sensors, list) and len(sensors) > 10:
+            #             print(
+            #                 f"  sensors=[{sensors[:5]}... ({len(sensors)} total)]")
+            #         else:
+            #             print(f"  sensors={sensors}")
+            #         print(f"  info={msg.get('info', {})}")
+            #     elif msg_type == "action":
+            #         actions = msg.get("actions", [])
+            #         print(f"  actions={actions}")
+            #         print(f"  info={msg.get('info', {})}")
+            #     elif msg_type == "reward":
+            #         print(f"  value={msg.get('value')}")
+            #         print(f"  info={msg.get('info', {})}")
+            #     elif msg_type == "terminal":
+            #         print(f"  info={msg.get('info', {})}")
+            #     else:
+            #         # For other message types, log the full message (but limit size)
+            #         msg_str = str(msg)
+            #         if len(msg_str) > 200:
+            #             print(f"  {msg_str[:200]}...")
+            #         else:
+            #             print(f"  {msg_str}")
 
             conn.send(msg)
 

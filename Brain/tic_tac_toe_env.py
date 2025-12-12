@@ -332,6 +332,177 @@ class TicTacToeEnv:
         print()
 
 
+def _flush_all_messages(connection_manager):
+    """Discard everything currently buffered."""
+    while True:
+        events = connection_manager.poll_events()
+        if not events:
+            break
+
+
+def _wait_for_valid_action(connection_manager, expected_player,
+                           brain_x_id, brain_o_id, episode, turn):
+    """
+    Wait until exactly one valid ACTION message arrives.
+    All others are ignored.
+    """
+    expected_id = brain_x_id if expected_player == 'X' else brain_o_id
+
+    while True:
+        events = connection_manager.poll_events()
+        if not events:
+            time.sleep(0.005)
+            continue
+
+        for peer_id, msg in events:
+            # Message logging disabled
+            # print(f"peer_id: {peer_id}, msg: {msg}")
+            # ignore non-dicts
+            if not isinstance(msg, dict):
+                continue
+
+            # ignore anything not ACTION
+            if msg.get("type") != "action":
+                # Message logging disabled
+                # print(f"not action: {msg.get('type')}")
+                continue
+
+            # must come from correct player
+            if peer_id != expected_id:
+                # Message logging disabled
+                # print(f"not expected id: {peer_id}")
+                continue
+
+            info = msg.get("info", {})
+            # must have correct episode
+            if info.get("episode") != episode:
+                # Message logging disabled
+                # print(f"not expected episode: {info.get('episode')}")
+                continue
+
+            # must have correct turn
+            if info.get("turn") != turn:
+                # Message logging disabled
+                # print(
+                #     f"not expected turn: {info.get('turn')}", f"turn: {turn}")
+                continue
+
+            # extract first action
+            actions = msg.get("actions", [])
+            if not actions:
+                # Message logging disabled
+                # print(f"no actions: {actions}")
+                continue
+
+            return int(actions[0])
+
+
+def run_tictactoe_state_machine(env, connection_manager, brain_x_id, brain_o_id, start_episode=1):
+    """
+    Deterministic, robust two-brain TicTacToe loop.
+    Assumes both brains are connected and identified.
+
+    env: TicTacToeEnv instance
+    connection_manager: ConnectionManager
+    brain_x_id, brain_o_id: peer_ids of the two brains
+    """
+    episode = start_episode
+    rng = np.random.RandomState()
+
+    while True:
+        # ------------------------------------------------------------------
+        # EPISODE START
+        # ------------------------------------------------------------------
+        env.reset()
+        done = False
+
+        # Choose starting player
+        current_player = 'X' if rng.random() < 0.5 else 'O'
+        turn = 0
+
+        # FLUSH any stale messages BEFORE sending initial observation
+        _flush_all_messages(connection_manager)
+
+        # ------------------------------------------------------------------
+        # MAIN TURN LOOP
+        # ------------------------------------------------------------------
+        while not done:
+            legal = env.get_valid_actions(current_player)
+            legal_mask = [0.0 if i in legal else float(
+                '-inf') for i in range(9)]
+
+            if current_player == 'X':
+                obs_x = env._get_obs('X').tolist()
+                connection_manager.send(brain_x_id, {
+                    "type": OBSERVATION,
+                    "episode": episode,
+                    "turn": turn,
+                    "sensors": obs_x,
+                    "info": {"episode": episode, "player": "X", "current_turn": "X", "legal_actions": legal_mask}
+                })
+            else:
+                obs_o = env._get_obs('O').tolist()
+                connection_manager.send(brain_o_id, {
+                    "type": OBSERVATION,
+                    "episode": episode,
+                    "turn": turn,
+                    "sensors": obs_o,
+                    "info": {"episode": episode, "player": "O", "current_turn": "O", "legal_actions": legal_mask}
+                })
+            # Wait for correct ACTION
+            action = _wait_for_valid_action(
+                connection_manager=connection_manager,
+                expected_player=current_player,
+                brain_x_id=brain_x_id,
+                brain_o_id=brain_o_id,
+                episode=episode,
+                turn=current_player
+            )
+
+            # Apply action
+            if current_player == 'X':
+                obs, reward, done, info = env.step(action)
+            else:
+                obs, reward, done, info = env.make_opponent_move(action)
+
+            # --------------------------------------------------------------
+            # TERMINAL: SEND REWARD + TERMINAL to BOTH
+            # --------------------------------------------------------------
+            if done:
+                if env.winner == 'X':
+                    reward_x, reward_o = 1.0, -1.0
+                elif env.winner == 'O':
+                    reward_x, reward_o = -1.0, 1.0
+                else:
+                    reward_x, reward_o = 0.0, 0.0
+
+                connection_manager.send(brain_x_id, {
+                    "type": REWARD,
+                    "value": float(reward_x),
+                    "info": {"episode": episode}
+                })
+                connection_manager.send(brain_o_id, {
+                    "type": REWARD,
+                    "value": float(reward_o),
+                    "info": {"episode": episode}
+                })
+                connection_manager.send(brain_x_id, {
+                    "type": TERMINAL,
+                    "info": {"episode": episode, "winner": env.winner}
+                })
+                connection_manager.send(brain_o_id, {
+                    "type": TERMINAL,
+                    "info": {"episode": episode, "winner": env.winner}
+                })
+                break
+
+            # Next player
+            current_player = 'O' if current_player == 'X' else 'X'
+            turn += 1
+        # END WHILE NOT DONE
+        episode += 1
+
+
 def run_env_server(
     host: str = "localhost",
     port: int = 6000,
@@ -466,292 +637,13 @@ def run_env_server(
 
                 if conn_x is not None and conn_o is not None:
                     print("[env] both players connected, starting matches...")
-                    # Start the game loop
-                    try:
-                        print("[env] Entering game loop...")
-                        episode = 0
-                        # Initialize random number generator for random starting player
-                        rng = np.random.RandomState()
-                        while True:
-                            # Start new episode
-                            episode += 1
-                            print(f"[env] Starting episode {episode}")
-                            env = TicTacToeEnv(training_mode=training_mode)
-                            env.reset()
-                            done = False
-                            # Randomly choose which player starts (X or O)
-                            current_player_symbol = 'X' if rng.random() < 0.5 else 'O'
-                            print(
-                                f"[env] Episode {episode}: {current_player_symbol} goes first")
 
-                            # Log every 100 episodes
-                            if episode % 100 == 0:
-                                print(f"[env] {episode} games played",
-                                      end='', flush=True)
+                    # Create environment instance
+                    env = TicTacToeEnv(training_mode=training_mode)
 
-                            # Send initial observations to both players
-                            # The brain client will only act when it's their turn
-                            legal_actions = env.get_valid_actions(
-                                current_player_symbol)
-                            legal_mask = [0.0 if i in legal_actions else float(
-                                '-inf') for i in range(9)]
-
-                            # Send initial observation only to the player who goes first
-                            # Verify connections exist before sending
-                            if brain_x_id not in connection_manager.connections:
-                                print(
-                                    f"[env] ERROR: brain_x_id {brain_x_id} not in connections!")
-                                raise ConnectionError(
-                                    f"Brain X ({brain_x_id}) not connected")
-                            if brain_o_id not in connection_manager.connections:
-                                print(
-                                    f"[env] ERROR: brain_o_id {brain_o_id} not in connections!")
-                                raise ConnectionError(
-                                    f"Brain O ({brain_o_id}) not connected")
-
-                            # Only send initial observation to the player who goes first
-                            if current_player_symbol == 'X':
-                                try:
-                                    obs_x = env._get_obs('X')
-                                    print(
-                                        f"[env] Sending initial observation to player X (brain {brain_x_id})")
-                                    connection_manager.send(brain_x_id, {
-                                        "type": OBSERVATION,
-                                        "sensors": obs_x.tolist(),
-                                        "info": {"t": 0.0, "episode": episode, "player": "X", "current_turn": current_player_symbol, "legal_actions": legal_mask},
-                                    })
-                                    print(
-                                        f"[env] Initial observation sent to player X")
-                                except Exception as e:
-                                    print(
-                                        f"[env] Player X disconnected while sending initial observation: {e}")
-                                    import traceback
-                                    traceback.print_exc()
-                                    raise  # Re-raise to trigger reconnection handling
-                            else:  # current_player_symbol == 'O'
-                                try:
-                                    obs_o = env._get_obs('O')
-                                    print(
-                                        f"[env] Sending initial observation to player O (brain {brain_o_id})")
-                                    connection_manager.send(brain_o_id, {
-                                        "type": OBSERVATION,
-                                        "sensors": obs_o.tolist(),
-                                        "info": {"t": 0.0, "episode": episode, "player": "O", "current_turn": current_player_symbol, "legal_actions": legal_mask},
-                                    })
-                                    print(
-                                        f"[env] Initial observation sent to player O")
-                                except Exception as e:
-                                    print(
-                                        f"[env] Player O disconnected while sending initial observation: {e}")
-                                    raise  # Re-raise to trigger reconnection handling
-
-                            # Small delay to allow initial observation to be received and any stale actions to arrive
-                            # time.sleep(0.2)
-                            # Clear any stale messages from previous episode (discard them)
-                            # stale_events = connection_manager.poll_events()
-                            # Discard any stale actions
-                            # for peer_id, msg in stale_events:
-                             #   if isinstance(msg, dict) and msg.get("type") == ACTION:
-                             #       pass  # Discard stale actions
-
-                            # Wait for actions and process game
-                            action_wait_count = 0
-                            print(
-                                f"[env] Entering game loop for episode {episode}, waiting for actions... (done={done})")
-                            while not done:
-                                # Debug: check if done changed
-                                if action_wait_count == 0:
-                                    print(
-                                        f"[env] Episode {episode}: Starting action wait loop, done={done}")
-                                # Poll for messages from both players
-                                events = connection_manager.poll_events()
-                                action_received = False
-
-                                # Log periodically if waiting for actions
-                                if action_wait_count % 100 == 0 and action_wait_count > 0:
-                                    print(
-                                        f"[env] Waiting for action from {current_player_symbol} (waited {action_wait_count * 0.01:.1f}s)")
-                                action_wait_count += 1
-
-                                for peer_id, msg in events:
-                                    if not isinstance(msg, dict):
-                                        continue
-
-                                    mtype = msg.get("type")
-
-                                    # Handle discovery messages (just log, no relaying)
-                                    if mtype in (DISCOVERY_STARTUP, DISCOVERY_SHUTDOWN):
-                                        sender_peer_id = msg.get(
-                                            "peer_id", "unknown")
-                                        print(
-                                            f"[env] Received {mtype} from {sender_peer_id}")
-                                        continue
-
-                                    # Only process ACTION messages from the current player
-                                    if mtype == ACTION:
-                                        # Determine which player this is (should only receive from active player now)
-                                        if peer_id == brain_x_id and current_player_symbol == 'X':
-                                            action_received = True
-                                            player_name = "X"
-                                            action_wait_count = 0  # Reset wait counter
-                                        elif peer_id == brain_o_id and current_player_symbol == 'O':
-                                            action_received = True
-                                            player_name = "O"
-                                            action_wait_count = 0  # Reset wait counter
-                                        else:
-                                            # Action from wrong player, ignore (should be rare now that we only send obs to active player)
-                                            # Only log if it happens multiple times to avoid spam
-                                            if not hasattr(env, '_wrong_action_count'):
-                                                env._wrong_action_count = {}
-                                            if peer_id not in env._wrong_action_count:
-                                                env._wrong_action_count[peer_id] = 0
-                                            env._wrong_action_count[peer_id] += 1
-                                            if env._wrong_action_count[peer_id] <= 3:
-                                                print(
-                                                    f"[env] Ignoring action from {peer_id} (not current player {current_player_symbol})")
-                                            continue
-
-                                        actions = msg.get("actions", [])
-                                        if not actions:
-                                            print(
-                                                f"[env] no actions in message from {player_name}")
-                                            continue
-
-                                        action = int(actions[0])
-
-                                        # Apply action to environment
-                                        if current_player_symbol == 'X':
-                                            obs, reward, done, info = env.step(
-                                                action)
-                                        else:
-                                            obs, reward, done, info = env.make_opponent_move(
-                                                action)
-
-                                        # Determine rewards for both players
-                                        if done:
-                                            if env.winner == 'X':
-                                                reward_x = 1.0
-                                                reward_o = -1.0
-                                            elif env.winner == 'O':
-                                                reward_x = -1.0
-                                                reward_o = 1.0
-                                            else:  # draw
-                                                reward_x = 0.0
-                                                reward_o = 0.0
-                                        else:
-                                            reward_x = 0.0
-                                            reward_o = 0.0
-
-                                        # Send updated observation only to the player whose turn it is next
-                                        next_player = 'O' if current_player_symbol == 'X' else 'X'
-                                        legal_actions = env.get_valid_actions(
-                                            next_player)
-                                        legal_mask = [0.0 if i in legal_actions else float(
-                                            '-inf') for i in range(9)]
-
-                                        # Only send observation to the player whose turn it is
-                                        if next_player == 'X':
-                                            try:
-                                                obs_x = env._get_obs('X')
-                                                connection_manager.send(brain_x_id, {
-                                                    "type": OBSERVATION,
-                                                    "sensors": obs_x.tolist(),
-                                                    "info": {"t": info.get("t", 0.0), "episode": episode, "player": "X", "current_turn": next_player, "legal_actions": legal_mask},
-                                                })
-                                            except Exception as e:
-                                                print(
-                                                    f"\n[env] Player X disconnected while sending observation: {e}")
-                                                raise
-                                        else:  # next_player == 'O'
-                                            try:
-                                                obs_o = env._get_obs('O')
-                                                connection_manager.send(brain_o_id, {
-                                                    "type": OBSERVATION,
-                                                    "sensors": obs_o.tolist(),
-                                                    "info": {"t": info.get("t", 0.0), "episode": episode, "player": "O", "current_turn": next_player, "legal_actions": legal_mask},
-                                                })
-                                            except Exception as e:
-                                                print(
-                                                    f"\n[env] Player O disconnected while sending observation: {e}")
-                                                raise
-
-                                        # Send rewards when game ends
-                                        if done:
-                                            try:
-                                                connection_manager.send(brain_x_id, {
-                                                    "type": REWARD,
-                                                    "value": float(reward_x),
-                                                    "info": {"t": info.get("t", 0.0), "episode": episode, "player": "X"},
-                                                })
-                                            except Exception as e:
-                                                print(
-                                                    f"\n[env] Player X disconnected while sending reward: {e}")
-                                                raise
-
-                                            try:
-                                                connection_manager.send(brain_o_id, {
-                                                    "type": REWARD,
-                                                    "value": float(reward_o),
-                                                    "info": {"t": info.get("t", 0.0), "episode": episode, "player": "O"},
-                                                })
-                                            except Exception as e:
-                                                print(
-                                                    f"\n[env] Player O disconnected while sending reward: {e}")
-                                                raise
-
-                                            # Send TERMINAL message to both players
-                                            try:
-                                                connection_manager.send(brain_x_id, {
-                                                    "type": TERMINAL,
-                                                    "info": {"t": info.get("t", 0.0), "episode": episode, "winner": env.winner},
-                                                })
-                                            except Exception as e:
-                                                print(
-                                                    f"\n[env] Player X disconnected while sending terminal: {e}")
-                                                raise
-
-                                            try:
-                                                connection_manager.send(brain_o_id, {
-                                                    "type": TERMINAL,
-                                                    "info": {"t": info.get("t", 0.0), "episode": episode, "winner": env.winner},
-                                                })
-                                            except Exception as e:
-                                                print(
-                                                    f"\n[env] Player O disconnected while sending terminal: {e}")
-                                                raise
-                                            break  # Game done
-
-                                        # Switch players
-                                        current_player_symbol = 'O' if current_player_symbol == 'X' else 'X'
-
-                                if not action_received:
-                                    # No action yet, wait a bit
-                                    time.sleep(0.01)
-                                    # Safety check: if we've been waiting too long and done is still False, something is wrong
-                                    if action_wait_count > 1000 and not done:
-                                        print(
-                                            f"[env] WARNING: Episode {episode} waiting too long for action from {current_player_symbol} (waited {action_wait_count * 0.01:.1f}s), done={done}")
-                                        # Don't break, just log - let it continue waiting
-                    except Exception as e:
-                        print(f"\n[env] Error in game loop: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        # ConnectionManager handles disconnections automatically
-                        # Just reassign brains and continue
-                        assign_brains()
-                        if brain_x_id is None or brain_o_id is None:
-                            print("[env] Waiting for brain reconnection...")
-                            break  # Exit game loop, go back to waiting
-                        else:
-                            # Brains are still connected, continue with next episode
-                            print(
-                                f"[env] Continuing with next episode after error (episode {episode})...")
-                            episode += 1  # Increment episode counter
-                            continue  # Continue to next episode in the outer while True loop
-
-                    except KeyboardInterrupt:
-                        print("\n[env] interrupted by user")
-                        break
+                    # Run clean state machine (never returns unless shutdown)
+                    run_tictactoe_state_machine(
+                        env, connection_manager, brain_x_id, brain_o_id)
 
         else:
             # Self-play mode (single brain)

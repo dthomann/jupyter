@@ -275,11 +275,6 @@ class MulticastDiscovery:
                 )
                 print(
                     f"[MulticastDiscovery] Discovered new {sender_kind}: {sender_id} at {sender_host}:{sender_port}")
-
-                # Count peers of the same kind before calling callback (while holding lock)
-                # This avoids deadlock when callback tries to count peers
-                same_kind_count = sum(
-                    1 for peer in self.peers.values() if peer.kind == sender_kind)
             else:
                 # Update existing peer
                 peer = self.peers[sender_id]
@@ -288,8 +283,16 @@ class MulticastDiscovery:
                 peer.host = sender_host
                 peer.port = sender_port
 
+            # Count peers of the same kind while holding lock.
+            # We pass this to callbacks so they don't need to re-acquire peers_lock.
+            same_kind_count = sum(
+                1 for peer in self.peers.values() if peer.kind == sender_kind)
+
         # Call callback outside the lock to avoid deadlock
-        if was_new and self.on_peer_discovered:
+        # NOTE: We call on_peer_discovered on *every* HELLO (not just the first time).
+        # This allows higher-level managers to reconnect after restarts and to react
+        # when the "number of environments" changes as stale entries expire.
+        if self.on_peer_discovered:
             try:
                 self.on_peer_discovered(
                     sender_id, sender_kind, sender_host, sender_port, same_kind_count)
@@ -306,28 +309,29 @@ class MulticastDiscovery:
                 break
 
             now = time.time()
-            expired = []
+            expired: list[str] = []
 
+            # Decide what's expired under lock
             with self.peers_lock:
                 for node_id, peer in list(self.peers.items()):
                     if now - peer.last_seen > self.peer_timeout:
                         expired.append(node_id)
 
-            # Remove expired peers
-            for node_id in expired:
-                with self.peers_lock:
+                # Remove expired peers under the same lock
+                for node_id in expired:
                     if node_id in self.peers:
-                        peer = self.peers.pop(node_id)
-                        print(
-                            f"[MulticastDiscovery] Peer {node_id} expired (no HELLO for {self.peer_timeout}s)")
+                        self.peers.pop(node_id, None)
 
-                        # Notify callback
-                        if self.on_peer_expired:
-                            try:
-                                self.on_peer_expired(node_id)
-                            except Exception as e:
-                                print(
-                                    f"[MulticastDiscovery] Error in on_peer_expired callback: {e}")
+            # Notify callbacks *outside* the lock to avoid deadlocks.
+            for node_id in expired:
+                print(
+                    f"[MulticastDiscovery] Peer {node_id} expired (no HELLO for {self.peer_timeout}s)")
+                if self.on_peer_expired:
+                    try:
+                        self.on_peer_expired(node_id)
+                    except Exception as e:
+                        print(
+                            f"[MulticastDiscovery] Error in on_peer_expired callback: {e}")
 
     def get_peers(self) -> Dict[str, PeerInfo]:
         """Get a copy of the current peer table."""

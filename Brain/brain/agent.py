@@ -321,16 +321,25 @@ class BrainAgent:
             self.current_z_mode = self.rng.normal(
                 0.0, z_sigma, size=self.mode_dim).astype(np.float32)
 
+    def _prepare_policy_state_with_mode(self, base_state):
+        """
+        Prepare policy state by concatenating mode variable if enabled.
+
+        Args:
+            base_state: Base policy state (x or z) without mode variable
+
+        Returns:
+            Policy state with mode variable concatenated if mode_dim > 0, otherwise base_state
+        """
+        self._ensure_mode_initialized()
+        if self.mode_dim > 0:
+            return np.concatenate([base_state, self.current_z_mode])
+        return base_state
+
     def act(self, obs, temperature=1.0, greedy=False, legal_mask=None):
         z, x = self.encode_state(obs)
-        policy_state = x if self.use_raw_obs_for_policy else z
-
-        # Ensure mode is initialized if needed
-        self._ensure_mode_initialized()
-
-        # Concatenate mode variable if enabled
-        if self.mode_dim > 0:
-            policy_state = np.concatenate([policy_state, self.current_z_mode])
+        base_policy_state = x if self.use_raw_obs_for_policy else z
+        policy_state = self._prepare_policy_state_with_mode(base_policy_state)
 
         # Hippocampal Retrieval (Context)
         # In a more advanced version, this would be appended to policy_state
@@ -385,17 +394,11 @@ class BrainAgent:
         total_reward = float(external_reward) * drive_gain + intrinsic_reward
 
         # 5. Get Value Estimates for Neuromodulators
-        policy_state = x if self.use_raw_obs_for_policy else z
-        policy_next_state = x_next if self.use_raw_obs_for_policy else z_next
-
-        # Ensure mode is initialized if needed
-        self._ensure_mode_initialized()
-
-        # Concatenate mode variable if enabled
-        if self.mode_dim > 0:
-            policy_state = np.concatenate([policy_state, self.current_z_mode])
-            policy_next_state = np.concatenate(
-                [policy_next_state, self.current_z_mode])
+        base_policy_state = x if self.use_raw_obs_for_policy else z
+        base_policy_next_state = x_next if self.use_raw_obs_for_policy else z_next
+        policy_state = self._prepare_policy_state_with_mode(base_policy_state)
+        policy_next_state = self._prepare_policy_state_with_mode(
+            base_policy_next_state)
 
         # We need values to compute RPE
         # Note: act() returns value, but we need it here cleanly
@@ -481,13 +484,9 @@ class BrainAgent:
             action = transition['action']
             legal_mask = transition.get('legal_mask')
 
-            policy_state = x if self.use_raw_obs_for_policy else z
-            # Ensure mode is initialized if needed
-            self._ensure_mode_initialized()
-            # Concatenate mode variable if enabled
-            if self.mode_dim > 0:
-                policy_state = np.concatenate(
-                    [policy_state, self.current_z_mode])
+            base_policy_state = x if self.use_raw_obs_for_policy else z
+            policy_state = self._prepare_policy_state_with_mode(
+                base_policy_state)
             reward = transition['total_reward']  # Use biological reward
 
             states.append(policy_state)
@@ -526,24 +525,10 @@ class BrainAgent:
         episode_num = info.get("episode", 0)
         # Update episode_index to match environment's episode number
         # This ensures we track episodes correctly even if brain was loaded with a higher episode_index
-        if episode_num > 0 and episode_num != self.episode_index:
-            # If this is a new episode (higher number), reset episode state
-            if episode_num > self.episode_index:
-                self.episode_index = episode_num
-                self.episode_board = None
-                self.episode_player = None
-                self.episode_states = []
-                self.episode_actions = []
-                self.episode_players = []
-                self.episode_masks = []
-                self.cum_reward = 0.0
-                self._current_episode_random_player = None
-                # Also clear STM on new episode if not done already
-                self.hippocampus.stm.clear()
-            else:
-                # Environment episode number is lower (e.g., environment restarted)
-                # Update to match environment but don't reset state
-                self.episode_index = episode_num
+        is_new_episode = episode_num > 0 and episode_num != self.episode_index
+        if is_new_episode:
+            # Reset episode state for new episode
+            self.episode_index = episode_num
             self.episode_board = None
             self.episode_player = None
             self.episode_states = []
@@ -552,17 +537,12 @@ class BrainAgent:
             self.episode_masks = []
             self.cum_reward = 0.0
             self._current_episode_random_player = None
-            # Also clear STM on new episode if not done already
             self.hippocampus.stm.clear()
 
             # Sample new mode variable for this episode
             if self.mode_dim > 0:
-                # Mode variance is gated by competence
-                # When competent (C_t → 1), z_sigma → 0 (deterministic)
-                # When not competent (C_t → 0), z_sigma → base value
                 z_sigma = self.get_competence_gated_z_sigma(
                     self.z_mode_sigma_base)
-                # Sample z_mode ~ N(0, z_sigma^2 * I)
                 self.current_z_mode = self.rng.normal(
                     0.0, z_sigma, size=self.mode_dim).astype(np.float32)
             else:
@@ -632,8 +612,7 @@ class BrainAgent:
             return None
 
         obs = np.array(self.last_sensors, dtype=np.float32)
-
-        prev_board = self.episode_board.copy() if self.episode_board is not None else None
+        # Store board state (copy to avoid mutation issues)
         self.episode_board = obs.copy()
 
         x_count = np.sum(self.episode_board == 1)
@@ -642,45 +621,41 @@ class BrainAgent:
 
         # In two-brain mode, only act when it's this brain's turn
         if self.my_player_symbol is not None:
-            # Check if observation info tells us whose turn it is
             info = getattr(self, '_last_observation_info', {})
-            current_turn_from_env = info.get("current_turn")
+            # "player" field indicates whose turn it is, "current_turn" is the turn number
+            current_player_from_env = info.get("player")
 
-            if current_turn_from_env is not None:
-                # Environment explicitly tells us whose turn it is
-                if current_turn_from_env != self.my_player_symbol:
-                    # Not this brain's turn, don't send action
-                    # Clear pending_decision to avoid repeatedly checking
-                    self.pending_decision = False
-                    # Debug: log why we're not acting (only once per episode)
-                    episode = info.get("episode", 0)
-                    log_key = f'_turn_check_logged_ep{episode}'
-                    if not hasattr(self, log_key):
-                        print(
-                            f"[brain] tick() returning None: current_turn={current_turn_from_env} != my_player={self.my_player_symbol}, episode={episode}")
-                        setattr(self, log_key, True)
-                    return None
-                else:
-                    # It's our turn - clear the log flag for this episode
-                    episode = info.get("episode", 0)
-                    log_key = f'_turn_check_logged_ep{episode}'
-                    if hasattr(self, log_key):
-                        delattr(self, log_key)
+            # Determine whose turn it is
+            if current_player_from_env is not None:
+                is_my_turn = (current_player_from_env == self.my_player_symbol)
             else:
-                # No current_turn in info - use fallback logic
                 # Fallback: determine from board state
                 current_turn_player = "X" if self.episode_player == 1 else "O"
-                if current_turn_player != self.my_player_symbol:
-                    # Not this brain's turn, don't send action
-                    # Clear pending_decision to avoid repeatedly checking
-                    self.pending_decision = False
-                    return None
+                is_my_turn = (current_turn_player == self.my_player_symbol)
 
+            if not is_my_turn:
+                self.pending_decision = False
+                # Debug log (only once per episode)
+                episode = info.get("episode", 0)
+                log_key = f'_turn_check_logged_ep{episode}'
+                if not hasattr(self, log_key):
+                    print(
+                        f"[brain] tick() returning None: current_player={current_player_from_env or current_turn_player} != my_player={self.my_player_symbol}, episode={episode}")
+                    setattr(self, log_key, True)
+                return None
+            else:
+                # Clear log flag if it exists
+                episode = info.get("episode", 0)
+                log_key = f'_turn_check_logged_ep{episode}'
+                if hasattr(self, log_key):
+                    delattr(self, log_key)
+
+        # Get legal actions mask
         if self.last_legal_actions is not None:
             legal_mask = self.last_legal_actions
-            if isinstance(legal_mask, np.ndarray):
-                if np.all(np.isinf(legal_mask) & (legal_mask < 0)):
-                    legal_mask = None
+            # Check if all actions are invalid
+            if isinstance(legal_mask, np.ndarray) and np.all(np.isinf(legal_mask) & (legal_mask < 0)):
+                legal_mask = None
         else:
             try:
                 legal_mask = self.get_legal_actions(obs)
@@ -736,21 +711,22 @@ class BrainAgent:
 
         if self.episode_based_learning and record_transition:
             # Store policy state with mode variable included
-            policy_state = x if self.use_raw_obs_for_policy else z
-            # Ensure mode is initialized if needed
-            self._ensure_mode_initialized()
-            if self.mode_dim > 0:
-                policy_state_with_mode = np.concatenate(
-                    [policy_state, self.current_z_mode])
+            base_policy_state = x if self.use_raw_obs_for_policy else z
+            policy_state_with_mode = self._prepare_policy_state_with_mode(
+                base_policy_state)
+            # Only copy if it's a numpy array to avoid unnecessary copies
+            if isinstance(policy_state_with_mode, np.ndarray):
+                self.episode_states.append(policy_state_with_mode.copy())
             else:
-                policy_state_with_mode = policy_state
-            self.episode_states.append(
-                policy_state_with_mode.copy() if isinstance(policy_state_with_mode, np.ndarray) else policy_state_with_mode)
+                self.episode_states.append(policy_state_with_mode)
             self.episode_actions.append(action)
             self.episode_players.append(self.episode_player)
             if legal_mask is not None:
-                self.episode_masks.append(legal_mask.copy() if isinstance(
-                    legal_mask, np.ndarray) else legal_mask)
+                # Only copy if it's a numpy array to avoid mutation issues
+                if isinstance(legal_mask, np.ndarray):
+                    self.episode_masks.append(legal_mask.copy())
+                else:
+                    self.episode_masks.append(legal_mask)
             else:
                 self.episode_masks.append(None)
 
@@ -781,232 +757,203 @@ class BrainAgent:
             return 0
         return None
 
+    def _calculate_episode_outcome(self, info):
+        """
+        Calculate episode outcome and rewards from environment info.
+
+        Returns:
+            tuple: (outcome, logged_outcome, rewards)
+            - outcome: Raw outcome from environment perspective (1.0=X wins, -1.0=O wins, 0.0=draw)
+            - logged_outcome: Outcome from agent's perspective
+            - rewards: List of rewards for each step in episode
+        """
+        winner = info.get("winner")
+        if winner == 'X':
+            outcome = 1.0
+        elif winner == 'O':
+            outcome = -1.0
+        elif winner == 'draw':
+            outcome = 0.0
+        else:
+            if self.episode_board is not None:
+                outcome = self._check_winner(self.episode_board)
+                if outcome is None:
+                    outcome = 0.0
+                else:
+                    outcome = float(outcome)
+            else:
+                outcome = 0.0
+
+        # Calculate rewards using raw outcome (from environment perspective)
+        # The rewards calculation (outcome * p) works correctly because:
+        # - Agent X: episode_players contains only [1, 1, ...], so rewards = outcome * 1
+        # - Agent O: episode_players contains only [-1, -1, ...], so rewards = outcome * (-1)
+        # This correctly gives positive rewards for wins and negative for losses
+        rewards = [outcome * p for p in self.episode_players]
+
+        # In two-brain mode, adjust logged outcome to be from this agent's perspective
+        # Raw outcome: 1.0 = X wins, -1.0 = O wins, 0.0 = draw
+        # For logging/statistics, we want the outcome from the agent's perspective:
+        #   Agent X: 1.0 = X wins (agent won), -1.0 = O wins (agent lost)
+        #   Agent O: 1.0 = O wins (agent won), -1.0 = X wins (agent lost)
+        logged_outcome = outcome
+        if self.my_player_symbol == 'O' and outcome != 0.0:
+            logged_outcome = -outcome  # Flip for agent O's perspective
+
+        return outcome, logged_outcome, rewards
+
+    def _replay_episode_for_learning(self, rewards, outcome, logged_outcome):
+        """
+        Replay episode to update internal biological state and policy.
+
+        Args:
+            rewards: List of external rewards for each step
+            outcome: Raw outcome from environment perspective
+            logged_outcome: Outcome from agent's perspective
+
+        Returns:
+            dict: Update metrics from policy update, or None if no update
+        """
+        if not (self.episode_based_learning and len(self.episode_states) > 0):
+            return None
+
+        # Convert states to numpy arrays (only if not already arrays)
+        states_np = []
+        for s in self.episode_states:
+            if isinstance(s, np.ndarray):
+                states_np.append(s.astype(np.float32, copy=False))
+            else:
+                states_np.append(np.array(s, dtype=np.float32))
+        final_biological_rewards = []
+
+        for i in range(len(states_np)):
+            s = states_np[i]
+            a = self.episode_actions[i]
+            ext_r = rewards[i]
+
+            # Extract base state (without mode) for world model learning
+            if self.mode_dim > 0:
+                base_state_dim = len(s) - self.mode_dim
+                s_base = s[:base_state_dim]
+            else:
+                s_base = s
+
+            # 1. World Model (for Intrinsic)
+            if i < len(states_np) - 1:
+                s_next = states_np[i+1]
+                done = False
+            else:
+                s_next = np.zeros_like(s)
+                done = True
+
+            neuromod_factor = 1.0  # Simplified for batch replay
+            pred_error_norm = 0.0
+            if self.use_raw_obs_for_policy:
+                _, pred_error_norm = self.world_model.learn(
+                    s_base, neuromod_factor, self.lr_model)
+
+            # 2. Intrinsic
+            intr_r, comps = self.intrinsic.compute(pred_error_norm)
+
+            # 3. Drives
+            self.drives.update(comps, ext_r)
+            drive_gain = self.drives.get_drive_multiplier()
+
+            # 4. Total Reward
+            total_r = ext_r * drive_gain + intr_r
+            final_biological_rewards.append(total_r)
+
+            # 5. Neuromodulators
+            v_curr, _ = self.actor_critic._forward_value(s)
+            v_next, _ = self.actor_critic._forward_value(s_next)
+            v_curr = v_curr.item()
+            v_next = v_next.item() if not done else 0.0
+
+            self.neuromodulators.update(
+                total_r, v_curr, v_next, pred_error_norm)
+
+            # Track DA and NE for competence calculation
+            self.da_error_window.append(abs(self.neuromodulators.dopamine))
+            self.ne_error_window.append(self.neuromodulators.norepinephrine)
+
+            # 6. Hippocampus
+            trans = (s, s, a, total_r, s_next, s_next, done)
+            self.hippocampus.process_experience(trans, self.neuromodulators)
+
+        # Track loss rate for competence calculation
+        agent_lost = False
+        if self.my_player_symbol is not None:
+            # logged_outcome is already from agent's perspective
+            agent_lost = (logged_outcome < 0)
+        else:
+            agent_lost = (outcome == 0.0)  # Draw = not competent
+        self.loss_rate_window.append(1.0 if agent_lost else 0.0)
+
+        # Update Policy with biological rewards using competence-gated LR and entropy
+        current_lr = self.get_competence_gated_lr(self.lr_policy)
+        current_entropy = self.get_competence_gated_entropy(self.entropy_coeff)
+
+        # Update competence signal at end of episode
+        self.update_competence()
+
+        update_metrics = self.actor_critic.update_reinforce(
+            states=states_np,
+            actions=self.episode_actions,
+            rewards=final_biological_rewards,
+            legal_masks=self.episode_masks if any(
+                m is not None for m in self.episode_masks) else None,
+            entropy_coeff=current_entropy,
+            lr=current_lr,
+            supervised_loss_coeff=self.supervised_loss_coeff,
+        )
+
+        self.hippocampus.consolidate_stm()
+        return update_metrics
+
+    def _update_metrics(self, logged_outcome, rewards, update_metrics):
+        """
+        Update training metrics and record episode data.
+
+        Args:
+            logged_outcome: Outcome from agent's perspective
+            rewards: List of rewards for each step
+            update_metrics: Metrics from policy update, or None
+        """
+        self.episode_outcomes.append(logged_outcome)
+
+        metrics_payload = {
+            "episode": int(self.episode_index),
+            "outcome": float(logged_outcome),
+            "episode_length": len(self.episode_actions),
+            "current_entropy": float(self._get_current_entropy()),
+            "current_lr": float(self._get_current_learning_rate()),
+            "competence": float(self.competence),
+            "norepinephrine": float(self.neuromodulators.norepinephrine),
+            "tonic_dopamine": float(self.neuromodulators.tonic_dopamine),
+            "tonic_acetylcholine": float(self.neuromodulators.tonic_acetylcholine),
+            "boredom": float(self.neuromodulators.boredom) if hasattr(self.neuromodulators, 'boredom') else 0.0,
+            "random_player": getattr(self, '_current_episode_random_player', None),
+        }
+        if self.episode_players:
+            players_np = np.array(self.episode_players, dtype=np.int8)
+            metrics_payload["x_moves"] = int((players_np == 1).sum())
+            metrics_payload["o_moves"] = int((players_np == -1).sum())
+        if update_metrics is not None:
+            metrics_payload.update(update_metrics)
+        metrics_payload.setdefault(
+            "mean_reward", float(np.mean(rewards)) if len(rewards) > 0 else 0.0)
+
+        self._record_training_metrics(metrics_payload)
+
     def _handle_terminal(self, info):
         if len(self.episode_states) > 0:
-            winner = info.get("winner")
-            if winner == 'X':
-                outcome = 1.0
-            elif winner == 'O':
-                outcome = -1.0
-            elif winner == 'draw':
-                outcome = 0.0
-            else:
-                if self.episode_board is not None:
-                    outcome = self._check_winner(self.episode_board)
-                    if outcome is None:
-                        outcome = 0.0
-                    else:
-                        outcome = float(outcome)
-                else:
-                    outcome = 0.0
+            outcome, logged_outcome, rewards = self._calculate_episode_outcome(
+                info)
+            update_metrics = self._replay_episode_for_learning(
+                rewards, outcome, logged_outcome)
+            self._update_metrics(logged_outcome, rewards, update_metrics)
 
-            # Calculate rewards using raw outcome (from environment perspective)
-            # The rewards calculation (outcome * p) works correctly because:
-            # - Agent X: episode_players contains only [1, 1, ...], so rewards = outcome * 1
-            # - Agent O: episode_players contains only [-1, -1, ...], so rewards = outcome * (-1)
-            # This correctly gives positive rewards for wins and negative for losses
-            rewards = [outcome * p for p in self.episode_players]
-
-            # In two-brain mode, adjust logged outcome to be from this agent's perspective
-            # Raw outcome: 1.0 = X wins, -1.0 = O wins, 0.0 = draw
-            # For logging/statistics, we want the outcome from the agent's perspective:
-            #   Agent X: 1.0 = X wins (agent won), -1.0 = O wins (agent lost)
-            #   Agent O: 1.0 = O wins (agent won), -1.0 = X wins (agent lost)
-            logged_outcome = outcome
-            if self.my_player_symbol == 'O' and outcome != 0.0:
-                logged_outcome = -outcome  # Flip for agent O's perspective
-
-            # This triggers update_from_episode logic if buffer has items
-            # But for BrainClient, we accumulate transitions in episode_buffer during play?
-            # BrainClient logic is mixed here. `tick` calls `act`.
-            # But `online_update` is NOT called in `tick`.
-            # `online_update` is usually called in a training loop.
-            # `BrainClient` (run_brain_client.py) just uses `tick` and `_handle_terminal`.
-            # Wait! `BrainAgent.tick` just returns the action. It does NOT do learning.
-            # `run_brain_client.py` relies on `_handle_terminal` to trigger training.
-            # But `_handle_terminal` in original code did:
-            # self.actor_critic.update_reinforce(...)
-
-            # The `online_update` method is for `run_continuous` loop, not for the `BrainClient` protocol used in `run_brain_client.py`.
-            # `run_brain_client.py` uses `tick` (inference) and `_handle_terminal` (update).
-            # So I need to put my "Biological Learning" logic into `_handle_terminal` or `tick` as well!
-
-            # Actually, for "Brain Client" (which is what the user asked to modify), I should ensure `tick` pushes to a buffer, and `_handle_terminal` processes it.
-            # `tick` currently appends to `self.episode_states`.
-            # I should also calculate intrinsic rewards, drives, neuromodulators during the episode?
-            # Or just at the end?
-            # Biological systems learn continuously.
-            # If I want `BrainClient` to be "biologically plausible", it should process rewards/observations as they come in.
-
-            # `on_observation` -> `tick` -> Action.
-            # `on_reward` -> Reward.
-
-            # I will enable "online" processing within `tick` if possible, or at least simulate it.
-            # But `BrainClient` is request/response.
-
-            # Let's stick to `_handle_terminal` doing the heavy lifting for the Episode-based TTT,
-            # BUT I must update Neuromodulators/Drives during the episode simulation in `_handle_terminal`.
-
-            # The problem: `_handle_terminal` does a batch update.
-            # I should iterate through the episode and update NM/Drives step-by-step to be accurate.
-
-            # Let's rewrite `_handle_terminal` to iterate through the episode history, calculate NM/Drive updates, and THEN do the policy update.
-
-            update_metrics = None
-
-            if self.episode_based_learning and len(self.episode_states) > 0:
-                states_np = [np.array(s, dtype=np.float32)
-                             for s in self.episode_states]
-
-                # Replay the episode to update internal biological state (NM, Drives, Hippocampus)
-                # This is "fast replay" or "consolidation" of the just-finished episode.
-                # We need the full trajectory.
-
-                final_biological_rewards = []
-
-                for i in range(len(states_np)):
-                    s = states_np[i]
-                    a = self.episode_actions[i]
-                    ext_r = rewards[i]
-
-                    # Extract base state (without mode) for world model learning
-                    if self.mode_dim > 0:
-                        base_state_dim = len(s) - self.mode_dim
-                        s_base = s[:base_state_dim]
-                    else:
-                        s_base = s
-
-                    # 1. World Model (for Intrinsic)
-                    # We don't have next_state easily for all steps unless we tracked it.
-                    # episode_states stores state at t.
-                    # We need s_{t+1}.
-                    if i < len(states_np) - 1:
-                        s_next = states_np[i+1]
-                        done = False
-                    else:
-                        # Create terminal state with same shape as s (including mode if present)
-                        s_next = np.zeros_like(s)
-                        done = True
-
-                    # Note: 's_base' here is the base policy_state (x or z) without mode.
-                    # If x, we can use it for WM learning.
-                    # If z, we can't easily learn WM (WM learns x->z).
-                    # Assuming use_raw_obs_for_policy=True (default for TTT), s_base is x.
-
-                    neuromod_factor = 1.0  # Simplified for batch replay
-                    pred_error_norm = 0.0
-                    if self.use_raw_obs_for_policy:
-                        # If s_base is x, we can learn
-                        _, pred_error_norm = self.world_model.learn(
-                            s_base, neuromod_factor, self.lr_model)
-
-                    # 2. Intrinsic
-                    intr_r, comps = self.intrinsic.compute(pred_error_norm)
-
-                    # 3. Drives
-                    self.drives.update(comps, ext_r)
-                    drive_gain = self.drives.get_drive_multiplier()
-
-                    # 4. Total Reward
-                    total_r = ext_r * drive_gain + intr_r
-                    final_biological_rewards.append(total_r)
-
-                    # 5. Neuromodulators
-                    # Estimate values
-                    # Note: s already includes mode variable if mode_dim > 0 (stored in tick)
-                    v_curr, _ = self.actor_critic._forward_value(s)
-                    v_next, _ = self.actor_critic._forward_value(s_next)
-                    v_curr = v_curr.item()
-                    v_next = v_next.item() if not done else 0.0
-
-                    self.neuromodulators.update(
-                        total_r, v_curr, v_next, pred_error_norm)
-
-                    # Track DA and NE for competence calculation
-                    self.da_error_window.append(
-                        abs(self.neuromodulators.dopamine))
-                    self.ne_error_window.append(
-                        self.neuromodulators.norepinephrine)
-
-                    # 6. Hippocampus
-                    # Store transition
-                    # We need 'obs' but we only have 'policy_state'.
-                    # Approximate
-                    trans = (s, s, a, total_r, s_next, s_next, done)
-                    self.hippocampus.process_experience(
-                        trans, self.neuromodulators)
-
-                # Track loss rate for competence calculation
-                # Determine if agent lost this episode
-                # For self-play: agent plays both sides, so we track if outcome != 0 (someone won)
-                # For two-brain mode: track if agent's player lost
-                # Use logged_outcome for this check since it's from the agent's perspective
-                agent_lost = False
-                if self.my_player_symbol is not None:
-                    # Two-brain mode: agent has a specific player symbol
-                    # logged_outcome is already from agent's perspective: < 0 = loss, > 0 = win
-                    agent_lost = (logged_outcome < 0)
-                else:
-                    # Self-play mode: agent plays both sides
-                    # In self-play, we can't really say the agent "lost" since it plays both sides
-                    # Instead, track draws as "not winning" - if outcome == 0, it's a draw
-                    # For competence, we want to track when the agent fails to win (draws or losses)
-                    # Since in self-play the agent is both players, we track draws as "not successful"
-                    # But actually, in self-play, we should track based on whether there was a clear winner
-                    # For now, let's track: loss = 1 if outcome == 0 (draw), 0 if outcome != 0 (someone won)
-                    # Actually, better: track based on whether the game ended in a draw
-                    # Draws indicate the agent hasn't learned optimal play yet
-                    agent_lost = (outcome == 0.0)  # Draw = not competent
-                self.loss_rate_window.append(1.0 if agent_lost else 0.0)
-
-                # Now update Policy with biological rewards using competence-gated LR and entropy
-                current_lr = self.get_competence_gated_lr(self.lr_policy)
-                current_entropy = self.get_competence_gated_entropy(
-                    self.entropy_coeff)
-
-                # Update competence signal at end of episode
-                self.update_competence()
-
-                update_metrics = self.actor_critic.update_reinforce(
-                    states=states_np,
-                    actions=self.episode_actions,
-                    rewards=final_biological_rewards,  # Use calculated bio rewards
-                    legal_masks=self.episode_masks if any(
-                        m is not None for m in self.episode_masks) else None,
-                    entropy_coeff=current_entropy,
-                    lr=current_lr,
-                    supervised_loss_coeff=self.supervised_loss_coeff,
-                )
-
-                self.hippocampus.consolidate_stm()
-
-            # Use logged_outcome for statistics (from agent's perspective)
-            self.episode_outcomes.append(logged_outcome)
-
-            metrics_payload = {
-                "episode": int(self.episode_index),
-                "outcome": float(logged_outcome),
-                "episode_length": len(self.episode_actions),
-                "current_entropy": float(self._get_current_entropy()),
-                "current_lr": float(self._get_current_learning_rate()),
-                "competence": float(self.competence),
-                "norepinephrine": float(self.neuromodulators.norepinephrine),
-                "tonic_dopamine": float(self.neuromodulators.tonic_dopamine),
-                "tonic_acetylcholine": float(self.neuromodulators.tonic_acetylcholine),
-                "boredom": float(self.neuromodulators.boredom) if hasattr(self.neuromodulators, 'boredom') else 0.0,
-                "random_player": getattr(self, '_current_episode_random_player', None),
-            }
-            if self.episode_players:
-                players_np = np.array(self.episode_players, dtype=np.int8)
-                metrics_payload["x_moves"] = int((players_np == 1).sum())
-                metrics_payload["o_moves"] = int((players_np == -1).sum())
-            if update_metrics is not None:
-                metrics_payload.update(update_metrics)
-            metrics_payload.setdefault(
-                "mean_reward", float(np.mean(rewards)) if len(rewards) > 0 else 0.0)
-
-            self._record_training_metrics(metrics_payload)
-
+            # Clear episode state
             self.episode_board = None
             self.episode_player = None
             self.episode_states = []

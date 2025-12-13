@@ -34,6 +34,9 @@ class TicTacToeEnv:
     - -1 for invalid move
     - 0 otherwise
     """
+    BOARD_SIZE = 3
+    BOARD_CELLS = 9
+    WIN_LENGTH = 3
 
     def __init__(self, agent_symbol='X', opponent_symbol='O', rng=None, training_mode=False):
         if rng is None:
@@ -52,7 +55,7 @@ class TicTacToeEnv:
         Reset the board to empty state.
         Returns observation from specified player's perspective (default: agent_symbol).
         """
-        self.board = np.zeros(9, dtype=np.int32)
+        self.board = np.zeros(self.BOARD_CELLS, dtype=np.int32)
         self.current_player = 'X'  # Agent goes first
         self.done = False
         self.winner = None
@@ -73,23 +76,25 @@ class TicTacToeEnv:
 
     def _check_winner(self):
         """Check if there's a winner. Returns 'X', 'O', 'draw', or None."""
-        board_2d = self.board.reshape(3, 3)
+        board_2d = self.board.reshape(self.BOARD_SIZE, self.BOARD_SIZE)
 
         # Check rows, columns, diagonals
-        for i in range(3):
+        for i in range(self.BOARD_SIZE):
             # Rows
-            if abs(board_2d[i].sum()) == 3:
-                return 'X' if board_2d[i].sum() > 0 else 'O'
+            row_sum = board_2d[i].sum()
+            if abs(row_sum) == self.WIN_LENGTH:
+                return 'X' if row_sum > 0 else 'O'
             # Columns
-            if abs(board_2d[:, i].sum()) == 3:
-                return 'X' if board_2d[:, i].sum() > 0 else 'O'
+            col_sum = board_2d[:, i].sum()
+            if abs(col_sum) == self.WIN_LENGTH:
+                return 'X' if col_sum > 0 else 'O'
 
         # Diagonals
         diag1 = board_2d[0, 0] + board_2d[1, 1] + board_2d[2, 2]
         diag2 = board_2d[0, 2] + board_2d[1, 1] + board_2d[2, 0]
-        if abs(diag1) == 3:
+        if abs(diag1) == self.WIN_LENGTH:
             return 'X' if diag1 > 0 else 'O'
-        if abs(diag2) == 3:
+        if abs(diag2) == self.WIN_LENGTH:
             return 'X' if diag2 > 0 else 'O'
 
         # Check for draw
@@ -102,7 +107,7 @@ class TicTacToeEnv:
         """Check if action is valid."""
         if not isinstance(action, (int, np.integer)):
             return False
-        if action < 0 or action >= 9:
+        if action < 0 or action >= self.BOARD_CELLS:
             return False
         return self.board[action] == 0
 
@@ -118,7 +123,8 @@ class TicTacToeEnv:
         Args:
             current_player_symbol: 'X' or 'O' - whose turn it is. Required in training mode.
         """
-        valid_actions = [i for i in range(9) if self.board[i] == 0]
+        valid_actions = [i for i in range(
+            self.BOARD_CELLS) if self.board[i] == 0]
 
         if not self.training_mode or current_player_symbol is None:
             return valid_actions
@@ -140,55 +146,45 @@ class TicTacToeEnv:
         # Otherwise, return all valid actions
         return valid_actions
 
+    def _get_winning_lines(self):
+        """
+        Get all winning lines (rows, columns, diagonals) as lists of indices.
+        Returns list of tuples, each containing indices for a winning line.
+        """
+        lines = []
+        # Rows
+        for i in range(self.BOARD_SIZE):
+            lines.append(tuple(i * self.BOARD_SIZE +
+                         j for j in range(self.BOARD_SIZE)))
+        # Columns
+        for j in range(self.BOARD_SIZE):
+            lines.append(tuple(i * self.BOARD_SIZE +
+                         j for i in range(self.BOARD_SIZE)))
+        # Diagonals
+        lines.append(tuple(i * self.BOARD_SIZE +
+                     i for i in range(self.BOARD_SIZE)))  # [0, 4, 8]
+        lines.append(tuple(i * self.BOARD_SIZE + (self.BOARD_SIZE - 1 - i)
+                     for i in range(self.BOARD_SIZE)))  # [2, 4, 6]
+        return lines
+
     def _find_winning_actions(self, player):
         """
         Find actions that would result in an immediate win for the given player.
         Returns list of action indices, or empty list if no immediate win possible.
         """
         winning_actions = []
-        board_2d = self.board.reshape(3, 3)
+        winning_lines = self._get_winning_lines()
 
-        # Check rows
-        for i in range(3):
-            row = board_2d[i]
-            if (row == player).sum() == 2 and (row == 0).sum() == 1:
-                # Find the empty spot in this row
-                for j in range(3):
-                    if row[j] == 0:
-                        action = i * 3 + j
-                        if action not in winning_actions:
-                            winning_actions.append(action)
+        for line_indices in winning_lines:
+            line_values = self.board[np.array(line_indices)]
+            player_count = np.sum(line_values == player)
+            empty_count = np.sum(line_values == 0)
 
-        # Check columns
-        for j in range(3):
-            col = board_2d[:, j]
-            if (col == player).sum() == 2 and (col == 0).sum() == 1:
-                # Find the empty spot in this column
-                for i in range(3):
-                    if col[i] == 0:
-                        action = i * 3 + j
-                        if action not in winning_actions:
-                            winning_actions.append(action)
-
-        # Check diagonal 1: [0, 4, 8]
-        diag1_indices = [0, 4, 8]
-        diag1_values = [self.board[i] for i in diag1_indices]
-        if diag1_values.count(player) == 2 and diag1_values.count(0) == 1:
-            # Find the empty spot
-            for idx in diag1_indices:
-                if self.board[idx] == 0:
-                    if idx not in winning_actions:
-                        winning_actions.append(idx)
-
-        # Check diagonal 2: [2, 4, 6]
-        diag2_indices = [2, 4, 6]
-        diag2_values = [self.board[i] for i in diag2_indices]
-        if diag2_values.count(player) == 2 and diag2_values.count(0) == 1:
-            # Find the empty spot
-            for idx in diag2_indices:
-                if self.board[idx] == 0:
-                    if idx not in winning_actions:
-                        winning_actions.append(idx)
+            if player_count == 2 and empty_count == 1:
+                # Find the empty spot in this line
+                empty_idx = line_indices[np.where(line_values == 0)[0][0]]
+                if empty_idx not in winning_actions:
+                    winning_actions.append(empty_idx)
 
         return winning_actions
 
@@ -259,76 +255,50 @@ class TicTacToeEnv:
     def _blocks_opponent_threat(self, action, player):
         """Check if the move blocks an opponent threat (two in a row)."""
         opponent = -player
-        board_2d = self.board.reshape(3, 3)
+        winning_lines = self._get_winning_lines()
 
-        # Check if opponent had two in a row that this move blocks
-        # Check rows
-        for i in range(3):
-            row = board_2d[i]
-            if (row == opponent).sum() == 2 and (row == player).sum() == 1:
-                if action in [i*3 + j for j in range(3)]:
-                    return True
-        # Check columns
-        for j in range(3):
-            col = board_2d[:, j]
-            if (col == opponent).sum() == 2 and (col == player).sum() == 1:
-                if action in [i*3 + j for i in range(3)]:
-                    return True
-        # Check diagonals
-        diag1_indices = [0, 4, 8]
-        diag1 = [self.board[i] for i in diag1_indices]
-        if action in diag1_indices and diag1.count(opponent) == 2 and diag1.count(player) == 1:
-            return True
-        diag2_indices = [2, 4, 6]
-        diag2 = [self.board[i] for i in diag2_indices]
-        if action in diag2_indices and diag2.count(opponent) == 2 and diag2.count(player) == 1:
-            return True
+        for line_indices in winning_lines:
+            if action not in line_indices:
+                continue
+            line_values = self.board[np.array(line_indices)]
+            opponent_count = np.sum(line_values == opponent)
+            player_count = np.sum(line_values == player)
+
+            if opponent_count == 2 and player_count == 1:
+                return True
         return False
 
     def _creates_threat(self, action, player):
         """Check if the move creates a threat (two in a row with empty third)."""
-        board_2d = self.board.reshape(3, 3)
+        winning_lines = self._get_winning_lines()
 
-        # Check if this move creates two in a row
-        # Check rows
-        for i in range(3):
-            row = board_2d[i]
-            if (row == player).sum() == 2 and (row == 0).sum() == 1:
-                if action in [i*3 + j for j in range(3)]:
-                    return True
-        # Check columns
-        for j in range(3):
-            col = board_2d[:, j]
-            if (col == player).sum() == 2 and (col == 0).sum() == 1:
-                if action in [i*3 + j for i in range(3)]:
-                    return True
-        # Check diagonals
-        diag1_indices = [0, 4, 8]
-        diag1 = [self.board[i] for i in diag1_indices]
-        if action in diag1_indices and diag1.count(player) == 2 and diag1.count(0) == 1:
-            return True
-        diag2_indices = [2, 4, 6]
-        diag2 = [self.board[i] for i in diag2_indices]
-        if action in diag2_indices and diag2.count(player) == 2 and diag2.count(0) == 1:
-            return True
+        for line_indices in winning_lines:
+            if action not in line_indices:
+                continue
+            line_values = self.board[np.array(line_indices)]
+            player_count = np.sum(line_values == player)
+            empty_count = np.sum(line_values == 0)
+
+            if player_count == 2 and empty_count == 1:
+                return True
         return False
 
     def render(self):
         """Print the current board state."""
-        board_2d = self.board.reshape(3, 3)
+        board_2d = self.board.reshape(self.BOARD_SIZE, self.BOARD_SIZE)
         symbols = {1: 'X', -1: 'O', 0: ' '}
 
-        print("\n  0   1   2")
-        for i in range(3):
+        print("\n  " + "   ".join(str(i) for i in range(self.BOARD_SIZE)))
+        for i in range(self.BOARD_SIZE):
             row_str = f"{i} "
-            for j in range(3):
+            for j in range(self.BOARD_SIZE):
                 val = board_2d[i, j]
                 row_str += f" {symbols[val]} "
-                if j < 2:
+                if j < self.BOARD_SIZE - 1:
                     row_str += "|"
             print(row_str)
-            if i < 2:
-                print("  -----------")
+            if i < self.BOARD_SIZE - 1:
+                print("  " + "-" * (self.BOARD_SIZE * 4 - 1))
         print()
 
 
@@ -345,10 +315,17 @@ def _wait_for_valid_action(connection_manager, expected_player,
     """
     Wait until exactly one valid ACTION message arrives.
     All others are ignored.
+    Raises ConnectionError if the expected brain disconnects.
     """
     expected_id = brain_x_id if expected_player == 'X' else brain_o_id
 
     while True:
+        # Check if expected brain is still connected
+        with connection_manager.connection_lock:
+            if expected_id not in connection_manager.connections:
+                raise ConnectionError(
+                    f"Brain {expected_id} disconnected while waiting for action")
+
         events = connection_manager.poll_events()
         if not events:
             time.sleep(0.005)
@@ -401,6 +378,7 @@ def run_tictactoe_state_machine(env, connection_manager, brain_x_id, brain_o_id,
     """
     Deterministic, robust two-brain TicTacToe loop.
     Assumes both brains are connected and identified.
+    Returns if either brain disconnects.
 
     env: TicTacToeEnv instance
     connection_manager: ConnectionManager
@@ -410,6 +388,12 @@ def run_tictactoe_state_machine(env, connection_manager, brain_x_id, brain_o_id,
     rng = np.random.RandomState()
 
     while True:
+        # Check if both brains are still connected at the start of each episode
+        with connection_manager.connection_lock:
+            if (brain_x_id not in connection_manager.connections or
+                    brain_o_id not in connection_manager.connections):
+                print(f"[env] Brain disconnected during game, exiting state machine")
+                return  # Return to outer loop to handle reconnection
         # ------------------------------------------------------------------
         # EPISODE START
         # ------------------------------------------------------------------
@@ -429,7 +413,7 @@ def run_tictactoe_state_machine(env, connection_manager, brain_x_id, brain_o_id,
         while not done:
             legal = env.get_valid_actions(current_player)
             legal_mask = [0.0 if i in legal else float(
-                '-inf') for i in range(9)]
+                '-inf') for i in range(env.BOARD_CELLS)]
 
             if current_player == 'X':
                 obs_x = env._get_obs('X').tolist()
@@ -438,8 +422,14 @@ def run_tictactoe_state_machine(env, connection_manager, brain_x_id, brain_o_id,
                     "episode": episode,
                     "turn": turn,
                     "sensors": obs_x,
-                    "info": {"episode": episode, "player": "X", "current_turn": "X", "legal_actions": legal_mask}
+                    "info": {"episode": episode, "player": "X", "current_turn": turn, "legal_actions": legal_mask}
                 })
+                # Check if connection is still valid after send
+                with connection_manager.connection_lock:
+                    if brain_x_id not in connection_manager.connections:
+                        print(
+                            f"[env] Brain X ({brain_x_id}) disconnected, exiting state machine")
+                        return
             else:
                 obs_o = env._get_obs('O').tolist()
                 connection_manager.send(brain_o_id, {
@@ -447,17 +437,27 @@ def run_tictactoe_state_machine(env, connection_manager, brain_x_id, brain_o_id,
                     "episode": episode,
                     "turn": turn,
                     "sensors": obs_o,
-                    "info": {"episode": episode, "player": "O", "current_turn": "O", "legal_actions": legal_mask}
+                    "info": {"episode": episode, "player": "O", "current_turn": turn, "legal_actions": legal_mask}
                 })
+                # Check if connection is still valid after send
+                with connection_manager.connection_lock:
+                    if brain_o_id not in connection_manager.connections:
+                        print(
+                            f"[env] Brain O ({brain_o_id}) disconnected, exiting state machine")
+                        return
             # Wait for correct ACTION
-            action = _wait_for_valid_action(
-                connection_manager=connection_manager,
-                expected_player=current_player,
-                brain_x_id=brain_x_id,
-                brain_o_id=brain_o_id,
-                episode=episode,
-                turn=current_player
-            )
+            try:
+                action = _wait_for_valid_action(
+                    connection_manager=connection_manager,
+                    expected_player=current_player,
+                    brain_x_id=brain_x_id,
+                    brain_o_id=brain_o_id,
+                    episode=episode,
+                    turn=turn
+                )
+            except ConnectionError as e:
+                print(f"[env] {e}, exiting state machine")
+                return  # Return to outer loop to handle reconnection
 
             # Apply action
             if current_player == 'X':
@@ -494,6 +494,13 @@ def run_tictactoe_state_machine(env, connection_manager, brain_x_id, brain_o_id,
                     "type": TERMINAL,
                     "info": {"episode": episode, "winner": env.winner}
                 })
+                # Check if connections are still valid after sending terminal messages
+                with connection_manager.connection_lock:
+                    if (brain_x_id not in connection_manager.connections or
+                            brain_o_id not in connection_manager.connections):
+                        print(
+                            f"[env] Brain disconnected while sending terminal messages, exiting state machine")
+                        return
                 break
 
             # Next player
@@ -560,24 +567,83 @@ def run_env_server(
         """Assign first two connected brains as X and O."""
         nonlocal brain_x_id, brain_o_id, logged_waiting_x, logged_waiting_o
 
-        connected_brains = [
-            peer_id for peer_id, metadata in connection_manager.connection_metadata.items()
-            if (peer_id in connection_manager.connections and
-                metadata.get("peer_type") == PEER_TYPE_BRAIN)
-        ]
+        # Get all connected brains
+        # We check connections first, then filter by metadata to ensure we catch newly connected brains
+        connected_brains = []
+        with connection_manager.connection_lock:
+            # First, get all active connections
+            active_connections = set(connection_manager.connections.keys())
+            # Then check metadata for each connection
+            for peer_id in active_connections:
+                metadata = connection_manager.connection_metadata.get(
+                    peer_id, {})
+                # Include if it's marked as a brain and not disconnected
+                if (metadata.get("peer_type") == PEER_TYPE_BRAIN and
+                        not metadata.get("disconnected", False)):
+                    connected_brains.append(peer_id)
 
-        if len(connected_brains) >= 1 and brain_x_id is None:
-            brain_x_id = connected_brains[0]
-            print(f"[env] Assigned brain {brain_x_id} as player X")
-            logged_waiting_x = False  # Reset flag when assigned
+        # Debug: log all connections to help diagnose issues (only when something changes)
+        if len(connected_brains) != (2 if brain_x_id and brain_o_id else (1 if brain_x_id or brain_o_id else 0)):
+            all_connections = list(connection_manager.connections.keys())
+            all_metadata = {pid: metadata.get("peer_type", "unknown")
+                            for pid, metadata in connection_manager.connection_metadata.items()}
+            print(f"[env] assign_brains: connected_brains={connected_brains}, "
+                  f"brain_x_id={brain_x_id}, brain_o_id={brain_o_id}, "
+                  f"all_connections={all_connections}, all_metadata={all_metadata}")
 
-        if len(connected_brains) >= 2 and brain_o_id is None:
-            # Find a different brain for O
-            for brain_id in connected_brains:
-                if brain_id != brain_x_id:
-                    brain_o_id = brain_id
+        # Check if currently assigned brains are still connected
+        if brain_x_id is not None:
+            if brain_x_id not in connection_manager.connections:
+                print(
+                    f"[env] Previously assigned brain X ({brain_x_id}) is no longer connected, resetting")
+                brain_x_id = None
+                logged_waiting_x = False
+            elif brain_x_id not in connected_brains:
+                print(
+                    f"[env] Previously assigned brain X ({brain_x_id}) is no longer valid, resetting")
+                brain_x_id = None
+                logged_waiting_x = False
+
+        if brain_o_id is not None:
+            if brain_o_id not in connection_manager.connections:
+                print(
+                    f"[env] Previously assigned brain O ({brain_o_id}) is no longer connected, resetting")
+                brain_o_id = None
+                logged_waiting_o = False
+            elif brain_o_id not in connected_brains:
+                print(
+                    f"[env] Previously assigned brain O ({brain_o_id}) is no longer valid, resetting")
+                brain_o_id = None
+                logged_waiting_o = False
+
+        # Role-sticky assignment:
+        # - Never move a live brain between X and O.
+        # - Only fill empty slots from currently connected brains.
+        # This ensures connection order (or restarts) doesn't matter in two-brain mode.
+
+        # Ensure X and O are distinct (should never happen, but be defensive)
+        if brain_x_id is not None and brain_o_id is not None and brain_x_id == brain_o_id:
+            print(
+                f"[env] WARNING: brain {brain_x_id} assigned to both X and O; clearing O and waiting for a distinct second brain")
+            brain_o_id = None
+            logged_waiting_o = False
+
+        # Assign X if empty: pick any connected brain that isn't currently O
+        if brain_x_id is None:
+            for candidate in connected_brains:
+                if candidate != brain_o_id:
+                    brain_x_id = candidate
+                    print(f"[env] Assigned brain {brain_x_id} as player X")
+                    logged_waiting_x = False
+                    break
+
+        # Assign O if empty: pick any connected brain that isn't currently X
+        if brain_o_id is None:
+            for candidate in connected_brains:
+                if candidate != brain_x_id:
+                    brain_o_id = candidate
                     print(f"[env] Assigned brain {brain_o_id} as player O")
-                    logged_waiting_o = False  # Reset flag when assigned
+                    logged_waiting_o = False
                     break
 
     try:
@@ -588,22 +654,89 @@ def run_env_server(
             if require_two_brains:
                 # Process incoming messages (including startup messages from brains)
                 # This is needed so we can identify which connections are brains
-                events = connection_manager.poll_events()
-                for peer_id, msg in events:
-                    if isinstance(msg, dict):
-                        mtype = msg.get("type")
-                        # Handle discovery messages (just log, no relaying)
-                        if mtype in (DISCOVERY_STARTUP, DISCOVERY_SHUTDOWN):
-                            sender_peer_id = msg.get("peer_id", "unknown")
-                            sender_peer_type = msg.get("peer_type", "unknown")
-                            print(
-                                f"[env] Received {mtype} from {sender_peer_id} (type: {sender_peer_type})")
-                            # Startup messages update peer_type, which helps assign_brains() identify brains
-                            continue
+                # Process events multiple times to ensure all startup messages are handled
+                # Keep processing until no more events arrive
+                max_iterations = 10
+                events_processed = False
+                startup_messages_received = False
+                for iteration in range(max_iterations):
+                    events = connection_manager.poll_events()
+                    if not events:
+                        # Check if there are any temporary connections waiting for startup messages
+                        if iteration == 0:
+                            with connection_manager.connection_lock:
+                                temp_connections = [pid for pid in connection_manager.connections.keys()
+                                                    if pid.startswith("incoming_")]
+                            if temp_connections:
+                                # Wait a bit for startup messages from temporary connections
+                                time.sleep(0.05)
+                                continue
+                            else:
+                                time.sleep(0.01)
+                        break
+                    events_processed = True
+                    for peer_id, msg in events:
+                        if isinstance(msg, dict):
+                            mtype = msg.get("type")
+                            # Handle discovery messages (just log, no relaying)
+                            if mtype in (DISCOVERY_STARTUP, DISCOVERY_SHUTDOWN):
+                                sender_peer_id = msg.get("peer_id", "unknown")
+                                sender_peer_type = msg.get(
+                                    "peer_type", "unknown")
+                                print(
+                                    f"[env] Received {mtype} from {sender_peer_id} (type: {sender_peer_type})")
+                                startup_messages_received = True
+                                # Startup messages update peer_type, which helps assign_brains() identify brains
+                                continue
+
+                # If we received startup messages, give a tiny moment for metadata updates to complete
+                if startup_messages_received:
+                    time.sleep(0.01)
 
                 # Environments do NOT proactively connect to brains
                 # Brains will connect to the environment after discovering it via multicast
                 # We only accept incoming connections from brains
+
+                # After processing events, check if there are any temporary connections
+                # (incoming_*) that haven't sent startup messages yet, or if there are
+                # new connections that we haven't processed startup messages for
+                # Keep polling until we've processed all startup messages
+                max_additional_polls = 5
+                for additional_poll in range(max_additional_polls):
+                    # Check for temporary connections that might be waiting for startup messages
+                    with connection_manager.connection_lock:
+                        temp_connections = [pid for pid in connection_manager.connections.keys()
+                                            if pid.startswith("incoming_")]
+                        # Also check if there are connections without peer_type set
+                        connections_without_type = [
+                            pid for pid in connection_manager.connections.keys()
+                            if not connection_manager.connection_metadata.get(pid, {}).get("peer_type")
+                        ]
+
+                    # If there are temporary connections or connections without type, wait a bit
+                    # and poll again to catch their startup messages
+                    if temp_connections or connections_without_type:
+                        time.sleep(0.05)
+
+                    # Process additional events to catch any startup messages
+                    additional_events = connection_manager.poll_events()
+                    if additional_events:
+                        for peer_id, msg in additional_events:
+                            if isinstance(msg, dict):
+                                mtype = msg.get("type")
+                                if mtype in (DISCOVERY_STARTUP, DISCOVERY_SHUTDOWN):
+                                    sender_peer_id = msg.get(
+                                        "peer_id", "unknown")
+                                    sender_peer_type = msg.get(
+                                        "peer_type", "unknown")
+                                    print(
+                                        f"[env] Received {mtype} from {sender_peer_id} (type: {sender_peer_type})")
+                                    startup_messages_received = True
+                        if startup_messages_received:
+                            time.sleep(0.01)  # Give metadata time to update
+                    elif not temp_connections and not connections_without_type:
+                        # No more events and no temporary connections, we're done
+                        break
 
                 assign_brains()
 
@@ -618,6 +751,16 @@ def run_env_server(
                     if not logged_waiting_o:
                         print("[env] waiting for second brain (player O)...")
                         logged_waiting_o = True
+                    time.sleep(0.1)
+                    continue
+
+                # Safety: never allow the same brain to occupy both roles.
+                # If this ever happens (shouldn't), clear O and wait for another brain.
+                if brain_x_id == brain_o_id:
+                    print(
+                        f"[env] WARNING: same brain assigned to X and O ({brain_x_id}); clearing O and waiting for a different second brain")
+                    brain_o_id = None
+                    logged_waiting_o = False
                     time.sleep(0.1)
                     continue
 
@@ -641,9 +784,23 @@ def run_env_server(
                     # Create environment instance
                     env = TicTacToeEnv(training_mode=training_mode)
 
-                    # Run clean state machine (never returns unless shutdown)
+                    # Run clean state machine (returns if a brain disconnects)
                     run_tictactoe_state_machine(
                         env, connection_manager, brain_x_id, brain_o_id)
+
+                    # State machine returned, check if connections are still valid
+                    # This handles the case where a brain disconnected during the game
+                    conn_x = get_brain_connection(brain_x_id)
+                    conn_o = get_brain_connection(brain_o_id)
+                    if conn_x is None:
+                        print(
+                            f"[env] Brain X ({brain_x_id}) disconnected, will reassign on next iteration")
+                        brain_x_id = None
+                    if conn_o is None:
+                        print(
+                            f"[env] Brain O ({brain_o_id}) disconnected, will reassign on next iteration")
+                        brain_o_id = None
+                    # Continue loop to reassign brains if needed
 
         else:
             # Self-play mode (single brain)
@@ -657,7 +814,8 @@ def run_env_server(
                         connected_brains = [
                             peer_id for peer_id, metadata in connection_manager.connection_metadata.items()
                             if (peer_id in connection_manager.connections and
-                                metadata.get("peer_type") == PEER_TYPE_BRAIN)
+                                metadata.get("peer_type") == PEER_TYPE_BRAIN and
+                                not metadata.get("disconnected", False))
                         ]
                         if connected_brains:
                             brain_id = connected_brains[0]
@@ -687,7 +845,7 @@ def run_env_server(
                         legal_actions = env.get_valid_actions(
                             current_player_symbol)
                         legal_mask = [0.0 if i in legal_actions else float(
-                            '-inf') for i in range(9)]
+                            '-inf') for i in range(env.BOARD_CELLS)]
                         connection_manager.send(brain_id, {
                             "type": OBSERVATION,
                             "sensors": x.tolist(),
@@ -749,7 +907,7 @@ def run_env_server(
                                     legal_actions = env.get_valid_actions(
                                         next_player_symbol)
                                     legal_mask = [0.0 if i in legal_actions else float(
-                                        '-inf') for i in range(9)]
+                                        '-inf') for i in range(env.BOARD_CELLS)]
                                     connection_manager.send(brain_id, {
                                         "type": OBSERVATION,
                                         "sensors": obs.tolist(),

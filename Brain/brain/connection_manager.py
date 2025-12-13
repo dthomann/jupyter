@@ -73,6 +73,15 @@ class ConnectionManager:
         # Lock for thread-safe connection management
         self.connection_lock = threading.Lock()
 
+        # Track outbound connection attempts to avoid spawning many duplicate threads
+        self._connect_in_progress: set[str] = set()
+        self._connect_state_lock = threading.Lock()
+
+        # Rate-limit discovery logging (HELLO callbacks can be frequent)
+        self._last_discovery_log: Dict[str, float] = {}
+        self._last_env_count: Optional[int] = None
+        self._last_env_decision_log: float = 0.0
+
         # Get listen address
         if not config.listen_address:
             # Auto-assign if not specified
@@ -84,11 +93,16 @@ class ConnectionManager:
 
         listen_host, listen_port = config.listen_address
 
+        # Choose a host to advertise in multicast HELLO.
+        # If we're bound to 0.0.0.0, that is not a routable destination address.
+        advertise_host = self._choose_advertise_host(
+            listen_host, multicast_group, multicast_port)
+
         # Initialize multicast discovery
         self.discovery = MulticastDiscovery(
             node_id=self.node_id,
             kind=peer_type,
-            listen_host=listen_host,
+            listen_host=advertise_host,
             listen_port=listen_port,
             multicast_group=multicast_group,
             multicast_port=multicast_port,
@@ -101,6 +115,34 @@ class ConnectionManager:
 
         # Start discovery
         self.discovery.start()
+
+    @staticmethod
+    def _choose_advertise_host(listen_host: str, multicast_group: str, multicast_port: int) -> str:
+        """
+        Pick a reasonable host/IP to advertise to peers.
+
+        Binding to 0.0.0.0 means "all interfaces" and cannot be used as a destination.
+        We try to infer the primary local IP without sending any packets.
+        """
+        if listen_host and listen_host not in ("0.0.0.0", "::"):
+            return listen_host
+
+        # Try to infer the local IP for the route we'd use to reach the multicast group.
+        for target in ((multicast_group, multicast_port), ("1.1.1.1", 80), ("8.8.8.8", 80)):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    s.connect(target)
+                    ip = s.getsockname()[0]
+                    if ip and ip != "0.0.0.0":
+                        return ip
+                finally:
+                    s.close()
+            except Exception:
+                continue
+
+        # Safe fallback for single-host setups.
+        return "127.0.0.1"
 
     def _start_listener(self):
         """Start listening for incoming connections."""
@@ -190,41 +232,80 @@ class ConnectionManager:
             return
 
         with self.connection_lock:
-            # Check if new_peer_id already has a connection (duplicate connection scenario)
+            # If new_peer_id already exists, fully clean it up first (this handles reconnections)
+            # When a brain reconnects, we want to treat it as a completely new connection
             if new_peer_id in self.connections:
                 old_conn = self.connections[new_peer_id]
                 print(
-                    f"[ConnectionManager] WARNING: peer_id {new_peer_id} already has a connection. Closing old connection.")
+                    f"[ConnectionManager] peer_id {new_peer_id} already exists (likely reconnection). Fully cleaning up old connection.")
                 try:
                     old_conn.close()
                 except Exception:
                     pass
-                # Remove old connection metadata if it exists
-                if new_peer_id in self.connection_metadata:
-                    del self.connection_metadata[new_peer_id]
+                del self.connections[new_peer_id]
+
+            # Also clean up any existing metadata for this peer_id
+            if new_peer_id in self.connection_metadata:
+                del self.connection_metadata[new_peer_id]
 
             # Move connection from old_peer_id to new_peer_id
             if old_peer_id in self.connections:
                 self.connections[new_peer_id] = self.connections.pop(
                     old_peer_id)
+            else:
+                # This shouldn't happen, but if old_peer_id is not in connections,
+                # the connection might have been cleaned up. Log a warning.
+                print(
+                    f"[ConnectionManager] WARNING: old_peer_id {old_peer_id} not in connections when updating to {new_peer_id}. Connection may have been cleaned up.")
 
-            # Move metadata
+            # Move or create metadata
             if old_peer_id in self.connection_metadata:
                 metadata = self.connection_metadata.pop(old_peer_id)
                 metadata.update(peer_info)
-                metadata["temp_id"] = False
-                self.connection_metadata[new_peer_id] = metadata
-                print(
-                    f"[ConnectionManager] Updated peer {old_peer_id} -> {new_peer_id}, peer_type={peer_info.get('peer_type')}")
+            else:
+                # Create new metadata if it doesn't exist
+                metadata = peer_info.copy()
+            metadata["temp_id"] = False
+            self.connection_metadata[new_peer_id] = metadata
+            print(
+                f"[ConnectionManager] Updated peer {old_peer_id} -> {new_peer_id}, peer_type={peer_info.get('peer_type')}")
 
         # Update discovery peer connection
-        self.discovery.set_peer_connection(
-            new_peer_id, self.connections.get(new_peer_id))
+        try:
+            conn = self.connections.get(new_peer_id)
+            # Check if peer exists in discovery (with lock to avoid race conditions)
+            # Use non-blocking lock acquisition to avoid deadlocks
+            peer_exists = False
+            try:
+                # Try to acquire lock without blocking
+                lock_acquired = self.discovery.peers_lock.acquire(
+                    blocking=False)
+                if lock_acquired:
+                    try:
+                        peer_exists = new_peer_id in self.discovery.peers
+                    finally:
+                        self.discovery.peers_lock.release()
+                else:
+                    # Lock is held by another thread - skip the check and assume peer doesn't exist
+                    # This avoids blocking and potential deadlocks
+                    peer_exists = False
+            except Exception:
+                # If lock acquisition fails for any reason, assume peer doesn't exist to avoid blocking
+                peer_exists = False
+            # Only call set_peer_connection if the peer exists in discovery
+            # This avoids blocking on the lock when the peer hasn't been discovered yet
+            if peer_exists:
+                self.discovery.set_peer_connection(new_peer_id, conn)
+        except Exception as e:
+            # Never raise from background/IO threads; just log and continue.
+            print(
+                f"[ConnectionManager] WARNING: failed to update discovery connection for {new_peer_id}: {e}")
 
     def _on_peer_discovered(self, node_id: str, kind: str, host: str, port: int, same_kind_count: int):
         """Callback when a new peer is discovered via multicast."""
-        print(
-            f"[ConnectionManager] {self.peer_type.capitalize()} {self.node_id} discovered {kind} {node_id} at {host}:{port}")
+        # We may get called on every HELLO. Keep this callback side-effect free unless
+        # we actually need to (re)connect, otherwise logs become misleading.
+        now = time.time()
 
         # Check if we should connect
         should_connect = False
@@ -234,52 +315,70 @@ class ConnectionManager:
             if kind == "environment":
                 # Use the count passed from discovery (avoids deadlock)
                 env_count = same_kind_count
-                print(
-                    f"[ConnectionManager] Brain {self.node_id} checking environment count: {env_count}")
+                self._last_env_count = env_count
                 if env_count == 1:
                     should_connect = True
-                    print(
-                        f"[ConnectionManager] Detected single environment {node_id}, connecting...")
                 else:
-                    print(
-                        f"[ConnectionManager] {env_count} environments detected, not auto-connecting")
+                    # Only log this occasionally, otherwise it spams every HELLO.
+                    if now - self._last_env_decision_log > 5.0:
+                        print(
+                            f"[ConnectionManager] Brain {self.node_id}: {env_count} environments detected; waiting for exactly 1 before auto-connect")
+                        self._last_env_decision_log = now
             else:
-                print(
-                    f"[ConnectionManager] Brain discovered {kind} {node_id}, not connecting (only connect to environments)")
+                # Brains don't connect to other kinds here.
+                pass
             # Brains don't auto-connect to other brains
         elif self.peer_type == "environment":
             # Environments do NOT proactively connect to brains
             # They only accept incoming connections from brains that connect to them
-            if kind == "brain":
-                print(
-                    f"[ConnectionManager] Environment discovered brain {node_id}, waiting for brain to connect...")
-                should_connect = False
-            else:
-                print(
-                    f"[ConnectionManager] Environment discovered {kind} {node_id}, not connecting")
+            should_connect = False
 
         if should_connect:
-            if node_id in self.connections:
-                print(
-                    f"[ConnectionManager] Already connected to {node_id}, skipping")
-            else:
-                print(
-                    f"[ConnectionManager] Starting connection thread to {node_id}...")
-                # Attempt connection in background
-                threading.Thread(
-                    target=self._connect_to_peer,
-                    args=(node_id, host, port, kind),
-                    daemon=True,
-                    name=f"ConnectTo{node_id}"
-                ).start()
-        else:
-            print(
-                f"[ConnectionManager] Not connecting to {node_id} (should_connect=False)")
+            # Only attempt when not already connected; _maybe_connect_to_peer also
+            # applies dedupe + backoff.
+            with self.connection_lock:
+                already_connected = node_id in self.connections
+            if not already_connected:
+                # Rate-limit "connect attempt" logs per peer
+                last = self._last_discovery_log.get(node_id, 0.0)
+                if now - last > 3.0:
+                    print(
+                        f"[ConnectionManager] {self.peer_type.capitalize()} {self.node_id} attempting connect to {kind} {node_id} at {host}:{port}")
+                    self._last_discovery_log[node_id] = now
+            self._maybe_connect_to_peer(node_id, host, port, kind)
 
     def _on_peer_expired(self, node_id: str):
         """Callback when a peer expires (no HELLO received)."""
         # Mark as disconnected
-        self._mark_disconnected(node_id)
+        self._mark_disconnected(node_id, keep_metadata=False)
+
+    def _maybe_connect_to_peer(self, node_id: str, host: str, port: int, kind: str):
+        """Schedule an outbound connect attempt with dedupe + backoff."""
+        address = (host, port)
+        now = time.time()
+
+        with self.connection_lock:
+            if node_id in self.connections:
+                return
+
+            md = self.connection_metadata.get(node_id, {})
+            # Backoff state
+            next_retry_at = float(md.get("next_retry_at", 0.0) or 0.0)
+            if now < next_retry_at:
+                return
+
+        with self._connect_state_lock:
+            if node_id in self._connect_in_progress:
+                return
+            self._connect_in_progress.add(node_id)
+
+        # Attempt connection in background
+        threading.Thread(
+            target=self._connect_to_peer,
+            args=(node_id, host, port, kind),
+            daemon=True,
+            name=f"ConnectTo{node_id}"
+        ).start()
 
     def _connect_to_peer(self, node_id: str, host: str, port: int, kind: str):
         """Attempt to connect to a peer."""
@@ -328,12 +427,34 @@ class ConnectionManager:
         except Exception as e:
             print(
                 f"[ConnectionManager] Failed to connect to {node_id} at {address}: {e}")
+            # Record backoff so we don't spin aggressively.
+            now = time.time()
             with self.connection_lock:
                 if node_id in self.connections:
+                    try:
+                        self.connections[node_id].close()
+                    except Exception:
+                        pass
                     del self.connections[node_id]
-                if node_id in self.connection_metadata:
-                    del self.connection_metadata[node_id]
-            # Will retry on next HELLO if peer is still alive
+
+                md = self.connection_metadata.get(node_id, {})
+                backoff = float(md.get("retry_backoff", 1.0) or 1.0)
+                # Exponential backoff with cap
+                backoff = min(backoff * 2.0, 10.0)
+                md.update({
+                    "is_incoming": False,
+                    "disconnected": True,
+                    "address": address,
+                    "peer_type": kind,
+                    "retry_backoff": backoff,
+                    "last_failed_connect_at": now,
+                    "next_retry_at": now + backoff,
+                })
+                self.connection_metadata[node_id] = md
+            # Retry will be scheduled by subsequent HELLOs.
+        finally:
+            with self._connect_state_lock:
+                self._connect_in_progress.discard(node_id)
 
     def _send_startup_message(self, peer_id: str):
         """Send startup message to a peer over TCP (only once per peer)."""
@@ -382,19 +503,24 @@ class ConnectionManager:
             connections_snapshot = list(self.connections.items())
 
         # Poll all connections for messages
+        # Batch last_seen updates to reduce lock contention
+        last_seen_updates = {}
+
         for peer_id, conn in connections_snapshot:
             try:
                 if conn.poll(0.0):
                     try:
                         msg = conn.recv()
+                        try:
 
-                        if isinstance(msg, dict):
-                            # Extract sender info from message
-                            sender_peer_id = msg.get(
-                                "peer_id") or msg.get("from_id")
-                            sender_peer_type = msg.get("peer_type", "unknown")
+                            if isinstance(msg, dict):
+                                # Extract sender info from message
+                                sender_peer_id = msg.get(
+                                    "peer_id") or msg.get("from_id")
+                                sender_peer_type = msg.get(
+                                    "peer_type", "unknown")
 
-                            # Message logging disabled
+                                # Message logging disabled
                             # msg_type = msg.get("type", "unknown")
                             # if not msg_type.startswith("discovery/"):
                             #     # Log the message with sender and receiver info
@@ -429,61 +555,85 @@ class ConnectionManager:
                             #         else:
                             #             print(f"  {msg_str}")
 
-                            # Update peer_id if this was a temporary incoming connection
-                            if peer_id.startswith("incoming_") and sender_peer_id and sender_peer_id != peer_id:
-                                # For environments, check brain connection limit before accepting new brain
-                                if (self.peer_type == "environment" and
-                                    sender_peer_type == "brain" and
-                                        self.max_brains is not None):
-                                    # Count existing brain connections (excluding this temporary one)
-                                    brain_count = sum(
-                                        1 for pid, metadata in self.connection_metadata.items()
-                                        if metadata.get("peer_type") == "brain" and pid != peer_id
-                                    )
-                                    if brain_count >= self.max_brains:
-                                        print(
-                                            f"[ConnectionManager] Environment {self.node_id} reached max_brains limit ({self.max_brains}), rejecting brain {sender_peer_id}")
-                                        # Disconnect using temp peer_id
-                                        self._mark_disconnected(peer_id)
-                                        continue  # Skip processing this message
+                                # Update peer_id if this was a temporary incoming connection
+                                # Only update on startup messages, not shutdown messages (shutdown messages are from old connections)
+                                peer_id_was_updated = False
+                                if (peer_id.startswith("incoming_") and sender_peer_id and sender_peer_id != peer_id and
+                                        msg.get("type") == "discovery/startup"):
+                                    # For environments, check brain connection limit before accepting new brain
+                                    if (self.peer_type == "environment" and
+                                        sender_peer_type == "brain" and
+                                            self.max_brains is not None):
+                                        # Count existing brain connections (excluding this temporary one)
+                                        # Only count brains that are actually connected (in self.connections)
+                                        with self.connection_lock:
+                                            brain_count = sum(
+                                                1 for pid, metadata in self.connection_metadata.items()
+                                                if (pid != peer_id and
+                                                    pid in self.connections and
+                                                    metadata.get("peer_type") == "brain")
+                                            )
+                                        if brain_count >= self.max_brains:
+                                            print(
+                                                f"[ConnectionManager] Environment {self.node_id} reached max_brains limit ({self.max_brains}), rejecting brain {sender_peer_id}")
+                                            # Disconnect using temp peer_id
+                                            self._mark_disconnected(peer_id)
+                                            continue  # Skip processing this message
 
-                                print(
-                                    f"[ConnectionManager] Updating peer_id from {peer_id} to {sender_peer_id} (type: {sender_peer_type})")
-                                self._update_peer_id(peer_id, sender_peer_id, {
-                                    "peer_type": sender_peer_type,
-                                    "address": msg.get("listen_address"),
-                                })
-                                peer_id = sender_peer_id
+                                    print(
+                                        f"[ConnectionManager] Updating peer_id from {peer_id} to {sender_peer_id} (type: {sender_peer_type})")
+                                    try:
+                                        self._update_peer_id(peer_id, sender_peer_id, {
+                                            "peer_type": sender_peer_type,
+                                            "address": msg.get("listen_address"),
+                                        })
+                                    except Exception as e:
+                                        raise
+                                    peer_id = sender_peer_id
+                                    peer_id_was_updated = True
 
-                            # Handle startup message - reply with our presence (only if we haven't already)
-                            if msg.get("type") == "discovery/startup" and sender_peer_id:
-                                print(
-                                    f"[ConnectionManager] Received startup message from {peer_id} (type: {sender_peer_type})")
-                                # Reply with our startup message (only once per peer)
-                                self._send_startup_message(peer_id)
+                                # Handle startup message - reply with our presence (only if we haven't already)
+                                # Only process actual startup messages as startup. A reconnecting brain sends a startup message,
+                                # not a shutdown message. Shutdown messages are from old connections and should be ignored.
+                                # Only process actual startup messages as startup
+                                if msg.get("type") == "discovery/startup" and sender_peer_id:
+                                    print(
+                                        f"[ConnectionManager] Received startup message from {peer_id} (type: {sender_peer_type})")
+                                    # Reply with our startup message (only once per peer)
+                                    self._send_startup_message(peer_id)
 
-                            msg["from_id"] = peer_id
-
-                            # Update last seen (with lock)
-                            with self.connection_lock:
-                                if peer_id in self.connection_metadata:
-                                    self.connection_metadata[peer_id]["last_seen"] = time.time(
-                                    )
-                                    self.connection_metadata[peer_id]["disconnected"] = False
-
-                            events.append((peer_id, msg))
+                                msg["from_id"] = peer_id
+                                # Batch last_seen update
+                                last_seen_updates[peer_id] = time.time()
+                                events.append((peer_id, msg))
+                        except Exception as e:
+                            print(
+                                f"[ConnectionManager] Error processing message from {peer_id}: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            continue
                     except (EOFError, OSError) as e:
                         print(
                             f"[ConnectionManager] Connection to {peer_id} lost: {e}")
-                        self._mark_disconnected(peer_id)
+                        self._mark_disconnected(
+                            peer_id, keep_metadata=not peer_id.startswith("incoming_"))
 
             except (EOFError, OSError) as e:
                 print(f"[ConnectionManager] Error polling {peer_id}: {e}")
-                self._mark_disconnected(peer_id)
+                self._mark_disconnected(
+                    peer_id, keep_metadata=not peer_id.startswith("incoming_"))
+
+        # Batch update last_seen for all processed messages
+        if last_seen_updates:
+            with self.connection_lock:
+                for pid, timestamp in last_seen_updates.items():
+                    if pid in self.connection_metadata:
+                        self.connection_metadata[pid]["last_seen"] = timestamp
+                        self.connection_metadata[pid]["disconnected"] = False
 
         return events
 
-    def _mark_disconnected(self, peer_id: str):
+    def _mark_disconnected(self, peer_id: str, keep_metadata: bool = True):
         """Mark a peer as disconnected."""
         with self.connection_lock:
             if peer_id in self.connections:
@@ -494,7 +644,13 @@ class ConnectionManager:
                 del self.connections[peer_id]
 
             if peer_id in self.connection_metadata:
-                self.connection_metadata[peer_id]["disconnected"] = True
+                if keep_metadata:
+                    self.connection_metadata[peer_id]["disconnected"] = True
+                    self.connection_metadata[peer_id]["last_disconnected"] = time.time(
+                    )
+                else:
+                    # Remove metadata for expired peers / temp connections
+                    del self.connection_metadata[peer_id]
 
         # Update discovery (outside lock to avoid deadlock)
         self.discovery.set_peer_connection(peer_id, None)
@@ -566,7 +722,8 @@ class ConnectionManager:
 
         except (EOFError, OSError) as e:
             print(f"[ConnectionManager] Failed to send to {peer_id}: {e}")
-            self._mark_disconnected(peer_id)
+            self._mark_disconnected(
+                peer_id, keep_metadata=not peer_id.startswith("incoming_"))
         except Exception as e:
             print(f"[ConnectionManager] Error sending to {peer_id}: {e}")
 
@@ -624,8 +781,6 @@ class ConnectionManager:
 
     def close(self):
         """Close all connections and shutdown listener."""
-        # Send shutdown messages to all known peers (attempt to connect if needed)
-        known_peers = self.discovery.get_peers()
         shutdown_msg = {
             "type": "discovery/shutdown",
             "peer_id": self.node_id,
@@ -641,22 +796,6 @@ class ConnectionManager:
                 self.send(peer_id, shutdown_msg)
             except Exception:
                 pass
-
-        # Attempt to connect and send to known but not connected peers
-        with self.connection_lock:
-            connected_peer_ids = set(self.connections.keys())
-
-        for node_id, peer_info in known_peers.items():
-            if node_id not in connected_peer_ids and node_id != self.node_id:
-                try:
-                    conn = Client((peer_info.host, peer_info.port),
-                                  authkey=self.config.authkey)
-                    msg = shutdown_msg.copy()
-                    msg["from_id"] = self.node_id
-                    conn.send(msg)
-                    conn.close()
-                except Exception:
-                    pass  # Ignore failures on shutdown
 
         self._shutdown.set()
 
